@@ -1,10 +1,9 @@
 //! Error types for the top-level Agglayer service.
-
 use agglayer_contracts::L1RpcError;
 pub use agglayer_storage::error::Error as StorageError;
-pub use agglayer_types::Digest;
-use agglayer_types::NetworkId;
-use ethers::{contract::ContractError, providers::Middleware, types::Address};
+pub use agglayer_types::primitives::Digest;
+use agglayer_types::{Address, CertificateId, Height, NetworkId, SignerError};
+use alloy::contract::Error as ContractError;
 
 pub use crate::rate_limiting::RateLimited as RateLimitedError;
 
@@ -14,11 +13,11 @@ pub enum CertificateRetrievalError {
     Storage(#[from] StorageError),
 
     #[error("Data for certificate {certificate_id} not found")]
-    NotFound { certificate_id: Digest },
+    NotFound { certificate_id: CertificateId },
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum CertificateSubmissionError<Rpc: Middleware> {
+pub enum CertificateSubmissionError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
@@ -26,15 +25,15 @@ pub enum CertificateSubmissionError<Rpc: Middleware> {
     OrchestratorNotResponsive,
 
     #[error("Failed to validate certificate signature: {0}")]
-    SignatureError(#[source] SignatureVerificationError<Rpc>),
+    SignatureError(#[source] SignatureVerificationError),
 
     #[error("Unable to replace pending certificate at height {height} for network {network_id}")]
     UnableToReplacePendingCertificate {
         reason: String,
-        height: u64,
+        height: Height,
         network_id: NetworkId,
-        stored_certificate_id: Digest,
-        replacement_certificate_id: Digest,
+        stored_certificate_id: CertificateId,
+        replacement_certificate_id: CertificateId,
         #[source]
         source: Option<L1RpcError>,
     },
@@ -42,14 +41,14 @@ pub enum CertificateSubmissionError<Rpc: Middleware> {
 
 /// Errors related to signature verification process.
 #[derive(thiserror::Error, Debug)]
-pub enum SignatureVerificationError<Rpc: Middleware> {
+pub enum SignatureVerificationError {
     /// FEP (0.1): The signer could not be recovered from the [`SignedTx`].
     #[error("could not recover transaction signer: {0}")]
-    CouldNotRecoverTxSigner(#[source] ethers::types::SignatureError),
+    CouldNotRecoverTxSigner(#[source] alloy::primitives::SignatureError),
 
     /// The signer could not be recovered from the certificate signature.
     #[error("could not recover certificate signer: {0}")]
-    CouldNotRecoverCertSigner(#[source] alloy::primitives::SignatureError),
+    CouldNotRecoverCertSigner(#[source] SignerError),
 
     /// The signer of the proof is not the trusted sequencer for the given
     /// rollup id.
@@ -67,9 +66,39 @@ pub enum SignatureVerificationError<Rpc: Middleware> {
     /// Generic network error when attempting to retrieve the trusted sequencer
     /// address from the rollup contract.
     #[error("contract error: {0}")]
-    ContractError(#[from] ContractError<Rpc>),
+    ContractError(#[from] ContractError),
 
-    /// SP1-based Aggchain proof not yet supported.
-    #[error("SP1-based Aggchain proof not yet supported")]
-    SP1AggchainProofUnsupported,
+    /// Signature is missing.
+    #[error("signature not provided")]
+    SignatureMissing,
+
+    /// Extra Certificate signature is missing for the given network.
+    #[error("missing extra signature from {expected_signer} for the network {network_id}")]
+    MissingExtraSignature {
+        network_id: NetworkId,
+        expected_signer: Address,
+    },
+
+    /// The extra signature is invalid.
+    #[error("invalid extra signature: {0}")]
+    InvalidExtraSignature(#[source] SignerError),
+
+    /// The pessimistic proof signature is invalid.
+    #[error("invalid pessimistic proof signature: {0}")]
+    InvalidPessimisticProofSignature(#[source] SignerError),
+}
+
+impl SignatureVerificationError {
+    pub fn from_signer_error(e: agglayer_types::SignerError) -> Self {
+        match e {
+            agglayer_types::SignerError::Missing => Self::SignatureMissing,
+            e @ agglayer_types::SignerError::Recovery(_) => Self::CouldNotRecoverCertSigner(e),
+            e @ agglayer_types::SignerError::InvalidExtraSignature { .. } => {
+                Self::InvalidExtraSignature(e)
+            }
+            e @ agglayer_types::SignerError::InvalidPessimisticProofSignature { .. } => {
+                Self::InvalidPessimisticProofSignature(e)
+            }
+        }
+    }
 }

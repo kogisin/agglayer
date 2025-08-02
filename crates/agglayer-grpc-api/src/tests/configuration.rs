@@ -6,7 +6,7 @@ use agglayer_config::{
 };
 use agglayer_grpc_client::node::v1::configuration_service_client::ConfigurationServiceClient;
 use agglayer_grpc_server::node::v1::configuration_service_server::ConfigurationServiceServer;
-use agglayer_grpc_types::{node::v1::GetEpochConfigurationRequest, protocol::types::v1};
+use agglayer_grpc_types::node::{types::v1, v1::GetEpochConfigurationRequest};
 use agglayer_rpc::AgglayerService;
 use agglayer_storage::{
     storage::backup::BackupClient,
@@ -47,7 +47,7 @@ async fn timeclock_configuration() {
     let error_info = err_details.error_info().unwrap();
     assert_eq!(
         error_info.reason,
-        agglayer_grpc_types::node::v1::ConfigurationErrorKind::UnexpectedClockConfiguration
+        agglayer_grpc_types::node::v1::GetEpochConfigurationErrorKind::UnexpectedClockConfiguration
             .as_str_name()
     );
     assert_eq!(

@@ -1,8 +1,10 @@
+#[cfg(any(test, feature = "testutils"))]
+use agglayer_primitives::keccak::Keccak256Hasher;
+#[cfg(any(test, feature = "testutils"))]
+pub use pessimistic_proof_core::proof::zero_if_empty_local_exit_root;
 pub use pessimistic_proof_core::PessimisticProofOutput;
 #[cfg(any(test, feature = "testutils"))]
-use pessimistic_proof_core::{
-    local_exit_tree::hasher::Keccak256Hasher, multi_batch_header::MultiBatchHeader, NetworkState,
-};
+use pessimistic_proof_core::{multi_batch_header::MultiBatchHeader, NetworkState};
 use serde::{Deserialize, Serialize};
 #[cfg(any(test, feature = "testutils"))]
 use sp1_sdk::{Prover, ProverClient, SP1Stdin};
@@ -45,6 +47,7 @@ impl Proof {
             proof: SP1Proof::Core(vec![]),
             public_values: SP1PublicValues::new(),
             sp1_version: "".to_string(),
+            tee_proof: None,
         })
     }
 
@@ -68,9 +71,10 @@ impl Proof {
 
 #[cfg(test)]
 mod tests {
+    use agglayer_tries::roots::LocalExitRoot;
     use pessimistic_proof_core::{
         keccak::keccak256_combine,
-        proof::{EMPTY_LER, EMPTY_PP_ROOT},
+        proof::{EMPTY_LER, EMPTY_PP_ROOT_V2},
     };
 
     use crate::local_state::LocalNetworkState;
@@ -79,7 +83,7 @@ mod tests {
     fn empty_tree_roots() {
         let empty_state = LocalNetworkState::default();
 
-        let ler = empty_state.exit_tree.get_root();
+        let ler = LocalExitRoot::new(empty_state.exit_tree.get_root());
         let ppr = keccak256_combine([
             empty_state.balance_tree.root.as_slice(),
             empty_state.nullifier_tree.root.as_slice(),
@@ -87,6 +91,6 @@ mod tests {
         ]);
 
         assert_eq!(EMPTY_LER, ler);
-        assert_eq!(EMPTY_PP_ROOT, ppr);
+        assert_eq!(EMPTY_PP_ROOT_V2, ppr);
     }
 }

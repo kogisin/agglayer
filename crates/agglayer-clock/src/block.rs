@@ -7,14 +7,15 @@ use std::{
     time::Duration,
 };
 
+use agglayer_types::EpochNumber;
 use alloy::{
     network::Ethereum,
     providers::{
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
         Identity, Provider, ProviderBuilder, RootProvider, WsConnect,
     },
-    pubsub::{ConnectionHandle, PubSubConnect, PubSubFrontend},
-    rpc::client::ClientBuilder,
+    pubsub::{ConnectionHandle, PubSubConnect, Subscription},
+    rpc::{client::ClientBuilder, types::Header},
     transports::{impl_future, TransportErrorKind, TransportResult},
 };
 use backoff::ExponentialBackoff;
@@ -32,8 +33,7 @@ type BlockProvider = FillProvider<
         Identity,
         JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
     >,
-    RootProvider<PubSubFrontend>,
-    PubSubFrontend,
+    RootProvider,
     Ethereum,
 >;
 
@@ -57,7 +57,7 @@ pub struct BlockClock<P> {
 #[async_trait::async_trait]
 impl<P> Clock for BlockClock<P>
 where
-    P: Provider<PubSubFrontend> + 'static,
+    P: Provider + 'static,
 {
     async fn spawn(mut self, cancellation_token: CancellationToken) -> Result<ClockRef, Error> {
         let (sender, _receiver) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
@@ -115,9 +115,7 @@ impl BlockClock<BlockProvider> {
     ) -> Result<Self, BlockClockError> {
         let ws = WsConnectWithRetries(ws, Some(max_reconnection_elapsed_time));
         let client = ClientBuilder::default().pubsub(ws).await?;
-        let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
-            .on_client(client);
+        let provider = ProviderBuilder::new().on_client(client);
 
         Ok(Self::new(provider, genesis_block, epoch_duration))
     }
@@ -134,18 +132,18 @@ pub enum BlockClockError {
     #[error("Failed to set the current block height, already set to: {0}")]
     SetBlockHeight(u64),
     #[error("Failed to set the current Epoch number: previous={0}, expected={1}")]
-    SetEpochNumber(u64, u64),
+    SetEpochNumber(EpochNumber, EpochNumber),
     #[error("Failed to notify the start of the Clock task")]
     UnableToNotifyStart,
     #[error("Transport initialization: {0}")]
     Transport(#[from] alloy::transports::RpcError<TransportErrorKind>),
-    #[error("Transport error: {0}")]
-    TransportError(#[from] tokio::sync::broadcast::error::RecvError),
+    #[error("L1 block channel unexpectedly closed")]
+    L1BlockChannelClosed,
 }
 
 impl<P> BlockClock<P>
 where
-    P: Provider<PubSubFrontend> + 'static,
+    P: Provider + 'static,
 {
     /// Run the Clock task.
     async fn run(
@@ -176,7 +174,7 @@ where
         debug!("Successfully subscribed to the L1 Block stream");
 
         while self.latest_seen_block < self.genesis_block {
-            let header = stream.recv().await?;
+            let header = Self::recv_block(&mut stream).await?;
             self.latest_seen_block = header.number;
 
             debug!("Current L1 Block number: {}", self.latest_seen_block);
@@ -220,7 +218,7 @@ where
                     warn!("Clock task cancelled");
                     break;
                 }
-                block_result = stream.recv() => {
+                block_result = Self::recv_block(&mut stream) => {
                     let block = block_result?;
                     if block.number <= self.latest_seen_block {
                         trace!("Skipping block: number={}, latest_seen_block={}", block.number, self.latest_seen_block);
@@ -253,6 +251,36 @@ where
         Ok(())
     }
 
+    async fn recv_block(stream: &mut Subscription<Header>) -> Result<Header, BlockClockError> {
+        #[cfg(test)]
+        {
+            // The default sleep fail point directive issues a blocking sleep.
+            // That does not play nice with code that is meant to be executed
+            // in an async runtime. Here, we abuse the return value injection
+            // to specify the timeout and use the tokio sleep instead.
+            fn get_delay() -> Duration {
+                fail::fail_point!("block_clock::BlockClock::recv_block::before", |d| {
+                    d.map(|d| Duration::from_secs(d.parse().unwrap()))
+                        .unwrap_or_default()
+                });
+                Duration::default()
+            }
+            tokio::time::sleep(get_delay()).await;
+        }
+
+        loop {
+            match stream.recv().await {
+                Ok(block) => break Ok(block),
+                Err(broadcast::error::RecvError::Closed) => {
+                    break Err(BlockClockError::L1BlockChannelClosed)
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Block clock L1 block subscription lagged by {n} messages");
+                }
+            }
+        }
+    }
+
     fn update_and_notify(
         &mut self,
         sender: &broadcast::Sender<Event>,
@@ -273,7 +301,7 @@ where
                         return Err(BlockClockError::SetEpochNumber(previous, expected));
                     }
                     Ok(epoch_ended) => {
-                        info!("Clock detected the end of the Epoch: {}", epoch_ended);
+                        info!("Clock detected the end of the Epoch: {epoch_ended}");
                         _ = sender.send(Event::EpochEnded(epoch_ended));
                     }
                 }
@@ -297,7 +325,10 @@ where
     ///
     /// To define the current Epoch number, the Epoch duration divides the Block
     /// height.
-    fn update_epoch_number(&mut self, current_block: u64) -> Result<u64, (u64, u64)> {
+    fn update_epoch_number(
+        &mut self,
+        current_block: u64,
+    ) -> Result<EpochNumber, (EpochNumber, EpochNumber)> {
         let current_epoch = Self::calculate_epoch_number(current_block, *self.epoch_duration);
         let expected_epoch = current_epoch.saturating_sub(1);
 
@@ -312,8 +343,8 @@ where
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
-            Ok(previous) => Ok(previous),
-            Err(stored) => Err((stored, expected_epoch)),
+            Ok(previous) => Ok(EpochNumber::new(previous)),
+            Err(stored) => Err((EpochNumber::new(stored), EpochNumber::new(expected_epoch))),
         }
     }
 }

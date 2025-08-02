@@ -11,11 +11,10 @@ use agglayer_storage::{
     },
 };
 use agglayer_types::{
-    Certificate, CertificateHeader, CertificateId, CertificateStatus, EpochConfiguration, Height,
-    NetworkId,
+    Address, Certificate, CertificateHeader, CertificateId, CertificateStatus, EpochConfiguration,
+    Height, NetworkId, Signature,
 };
 use error::SignatureVerificationError;
-use ethers::types::{TransactionReceipt, H160, H256};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -193,21 +192,36 @@ where
     DebugStore: DebugReader + DebugWriter + 'static,
     L1Rpc: RollupContract + L1TransactionFetcher + 'static,
 {
+    fn get_known_certificate_id_at_height(
+        &self,
+        network_id: NetworkId,
+        height: Height,
+    ) -> Result<Option<CertificateId>, agglayer_storage::error::Error> {
+        // TODO This should be in a database transaction to get a consistent
+        // view of the storage.
+        if let Some(cert) = self.pending_store.get_certificate(network_id, height)? {
+            return Ok(Some(cert.hash()));
+        }
+        let certificate_id = self
+            .state
+            .get_certificate_header_by_cursor(network_id, height)?
+            .map(|header| header.certificate_id);
+        Ok(certificate_id)
+    }
+
     #[instrument(skip(self, certificate), level = "info")]
     async fn validate_pre_existing_certificate(
         &self,
         certificate: &Certificate,
-    ) -> Result<(), CertificateSubmissionError<L1Rpc::M>> {
+    ) -> Result<(), CertificateSubmissionError> {
         let new_certificate_id = certificate.hash();
         // Get pre-existing certificate in pending
-        if let Some(certificate) = self
-            .pending_store
-            .get_certificate(certificate.network_id, certificate.height)?
+        if let Some(pre_existing_certificate_id) =
+            self.get_known_certificate_id_at_height(certificate.network_id, certificate.height)?
         {
-            let pre_existing_certificate_id = certificate.hash();
             warn!(
                 pre_existing_certificate_id = pre_existing_certificate_id.to_string(),
-                "Certificate already exists in pending store for network {} at height {}",
+                "Certificate already exists in store for network {} at height {}",
                 certificate.network_id,
                 certificate.height
             );
@@ -222,14 +236,14 @@ where
                 match settlement_tx_hash {
                     None => {
                         info!(
-                            "Replacing pending certificate {} that is in error",
+                            "Replacing certificate {} that is in error",
                             pre_existing_certificate_id
                         );
                     }
                     Some(tx_hash) => {
                         let l1_transaction = self
                             .l1_rpc_provider
-                            .fetch_transaction_receipt(H256::from_slice(tx_hash.as_ref()))
+                            .fetch_transaction_receipt(tx_hash.into())
                             .await
                             .map_err(|error| {
                                 warn!(
@@ -247,8 +261,7 @@ where
                                 }
                             })?;
 
-                        if matches!(l1_transaction, TransactionReceipt { status: Some(status), .. } if status.as_u64() == 0)
-                        {
+                        if !l1_transaction.status() {
                             info!(
                                 %pre_existing_certificate_id,
                                 %tx_hash,
@@ -256,8 +269,8 @@ where
                                 "Replacing pending certificate in error that has already been settled, but transaction receipt status is in failure"
                             );
                         } else {
-                            let message = "Unable to replace a pending certificate in error that \
-                                           has already been settled";
+                            let message = "Unable to replace a certificate in error that has \
+                                           already been settled";
                             warn!(%pre_existing_certificate_id, %tx_hash, ?l1_transaction, message);
 
                             return Err(
@@ -274,7 +287,7 @@ where
                     }
                 }
             } else {
-                let message = "Unable to replace a pending certificate that is not in error";
+                let message = "Unable to replace a certificate that is not in error";
                 info!(%pre_existing_certificate_id, message);
 
                 return Err(
@@ -292,59 +305,101 @@ where
 
         Ok(())
     }
+
     /// Verify that the signer of the given [`Certificate`] is the trusted
     /// sequencer for the rollup id it specified.
     #[instrument(skip(self), level = "debug")]
     pub(crate) async fn verify_cert_signature(
         &self,
         cert: &Certificate,
-    ) -> Result<(), SignatureVerificationError<L1Rpc::M>> {
+    ) -> Result<(), SignatureVerificationError> {
         let sequencer_address = self
             .l1_rpc_provider
-            .get_trusted_sequencer_address(*cert.network_id, self.config.proof_signers.clone())
+            .get_trusted_sequencer_address(
+                cert.network_id.to_u32(),
+                self.config.proof_signers.clone(),
+            )
             .await
             .map_err(|_| {
                 SignatureVerificationError::UnableToRetrieveTrustedSequencerAddress(cert.network_id)
             })?;
 
-        let signer: H160 = cert
-            .signer()
-            .map_err(SignatureVerificationError::CouldNotRecoverCertSigner)?
-            .ok_or(SignatureVerificationError::SP1AggchainProofUnsupported)?
-            .into_array()
-            .into();
+        cert.verify_cert_signature(sequencer_address)
+            .map_err(SignatureVerificationError::from_signer_error)
+    }
 
-        // ECDSA-k256 signature verification works by recovering the public key from the
-        // signature, and then checking that it is the expected one.
-        if signer != sequencer_address {
-            return Err(SignatureVerificationError::InvalidSigner {
-                signer,
-                trusted_sequencer: sequencer_address,
-            });
-        }
+    /// Verify the extra [`Certificate`] signature.
+    #[instrument(skip_all, level = "debug")]
+    pub(crate) fn verify_extra_cert_signature(
+        &self,
+        certificate: &Certificate,
+        extra_signer: Option<&Address>,
+        extra_signature: Option<Signature>,
+    ) -> Result<(), SignatureVerificationError> {
+        match (extra_signer, extra_signature) {
+            // Extra signature expected and provided
+            (Some(&expected_extra_signer), Some(extra_signature)) => certificate
+                .verify_extra_signature(expected_extra_signer, extra_signature)
+                .map_err(SignatureVerificationError::from_signer_error)?,
+            // Extra signature is expected but missing
+            (Some(&expected_signer), None) => {
+                return Err(SignatureVerificationError::MissingExtraSignature {
+                    network_id: certificate.network_id,
+                    expected_signer,
+                });
+            }
+            // Extra signature provided but not required
+            (None, Some(_)) => {
+                warn!("Unexpected extra signature provided");
+            }
+            // No extra signature provided nor required
+            (None, None) => {}
+        };
 
         Ok(())
     }
-    #[instrument(skip(self, certificate), fields(hash, rollup_id = *certificate.network_id), level = "info")]
+
+    #[instrument(skip(self, certificate), fields(hash, rollup_id = certificate.network_id.to_u32()), level = "info")]
     pub async fn send_certificate(
         &self,
         certificate: Certificate,
-    ) -> Result<CertificateId, CertificateSubmissionError<L1Rpc::M>> {
+        extra_signature: Option<Signature>,
+    ) -> Result<CertificateId, CertificateSubmissionError> {
         let hash = certificate.hash();
         let hash_string = hash.to_string();
         tracing::Span::current().record("hash", &hash_string);
 
         info!(
             %hash,
-            "Received certificate {hash} for rollup {} at height {}", *certificate.network_id, certificate.height
+            "Received certificate {hash} for rollup {} at height {}", certificate.network_id.to_u32(), certificate.height
         );
         self.validate_pre_existing_certificate(&certificate).await?;
+
+        // Verify the extra certificate signature
+        self.verify_extra_cert_signature(
+            &certificate,
+            self.config()
+                .extra_certificate_signer
+                .get(&certificate.network_id.to_u32()),
+            extra_signature,
+        )
+        .map_err(|error| {
+            error!(
+                ?error,
+                "Failed to verify the extra signature for the certificate"
+            );
+            CertificateSubmissionError::SignatureError(error)
+        })?;
+
+        // Verify the certificate signature
         self.verify_cert_signature(&certificate)
             .await
-            .map_err(|e| {
-                error!(error = %e, hash = hash_string, "Failed to verify the signature of
-        certificate {hash}: {e}");
-                CertificateSubmissionError::SignatureError(e)
+            .map_err(|error| {
+                error!(
+                    ?error,
+                    "Failed to verify the signature within the certificate"
+                );
+                CertificateSubmissionError::SignatureError(error)
             })?;
 
         // TODO: Batch the different queries.

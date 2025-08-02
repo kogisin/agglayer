@@ -1,36 +1,31 @@
 use std::collections::HashMap;
 
-use agglayer_grpc_types::node::v1::CertificateSubmissionErrorKind;
+use agglayer_grpc_types::node::v1::SubmitCertificateErrorKind;
 use agglayer_rpc::CertificateSubmissionError;
-use ethers::providers::Middleware;
-use tonic_types::ErrorDetails;
-use tonic_types::StatusExt as _;
+use tonic_types::{ErrorDetails, StatusExt as _};
+use tracing::{error, warn};
 
-pub(crate) struct CertificateSubmissionErrorWrapper<Rpc: Middleware> {
-    inner: CertificateSubmissionError<Rpc>,
+pub(crate) struct CertificateSubmissionErrorWrapper {
+    inner: CertificateSubmissionError,
     context: &'static str,
 }
 
-impl<Rpc> CertificateSubmissionErrorWrapper<Rpc>
-where
-    Rpc: Middleware,
-{
-    pub(crate) fn new(inner: CertificateSubmissionError<Rpc>, context: &'static str) -> Self {
+impl CertificateSubmissionErrorWrapper {
+    pub(crate) fn new(inner: CertificateSubmissionError, context: &'static str) -> Self {
         Self { inner, context }
     }
 }
 
-impl<Rpc> From<CertificateSubmissionErrorWrapper<Rpc>> for tonic::Status
-where
-    Rpc: Middleware,
-{
-    fn from(error: CertificateSubmissionErrorWrapper<Rpc>) -> Self {
+impl From<CertificateSubmissionErrorWrapper> for tonic::Status {
+    fn from(error: CertificateSubmissionErrorWrapper) -> Self {
         match error.inner {
-            agglayer_rpc::CertificateSubmissionError::Storage(_) => {
+            agglayer_rpc::CertificateSubmissionError::Storage(error) => {
+                error!(?error, "returning internal storage error to RPC");
                 tonic::Status::internal("Internal storage error")
             }
 
             agglayer_rpc::CertificateSubmissionError::OrchestratorNotResponsive => {
+                warn!("returning orchestrator not responsive to RPC");
                 tonic::Status::internal("Orchestrator not responsive")
             }
 
@@ -40,7 +35,7 @@ where
                 tonic::Code::InvalidArgument,
                 "Signature verification error",
                 ErrorDetails::with_error_info(
-                    CertificateSubmissionErrorKind::SignatureVerification.as_str_name(),
+                    SubmitCertificateErrorKind::SignatureVerification.as_str_name(),
                     error.context,
                     [("error".into(), format!("{signature_verification_error:?}"))],
                 ),
@@ -78,8 +73,7 @@ where
                     tonic::Code::InvalidArgument,
                     "Unable to replace pending certificate",
                     ErrorDetails::with_error_info(
-                        CertificateSubmissionErrorKind::UnableToReplacePendingCertificate
-                            .as_str_name(),
+                        SubmitCertificateErrorKind::UnableToReplacePendingCertificate.as_str_name(),
                         error.context,
                         details,
                     ),

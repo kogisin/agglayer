@@ -20,8 +20,7 @@ use tonic::{
     codec::CompressionEncoding,
     server::NamedService,
 };
-use tower::Service;
-use tower::ServiceExt as _;
+use tower::{Service, ServiceExt as _};
 
 mod certificate_submission_service;
 mod configuration_service;
@@ -128,7 +127,7 @@ impl Server {
             .add_rpc_service(configuration_service)
             .add_rpc_service(network_state_service)
             .add_reflection_service(agglayer_grpc_types::node::v1::FILE_DESCRIPTOR_SET)
-            .add_reflection_service(agglayer_grpc_types::protocol::types::v1::FILE_DESCRIPTOR_SET)
+            .add_reflection_service(agglayer_interop::grpc::v1::FILE_DESCRIPTOR_SET)
     }
 }
 

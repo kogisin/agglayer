@@ -35,12 +35,18 @@ fn main() -> anyhow::Result<()> {
                             .context("Failed to serialize ValidateConfig to TOML")?
                     );
                 }
-                Err(error) => eprintln!("{}", error),
+                Err(error) => eprintln!("{error}"),
             }
         }
         cli::Commands::Vkey => {
-            let vkey = agglayer_prover::get_vkey(ELF);
-            println!("{}", vkey);
+            let vkey_hex = agglayer_prover::compute_program_vkey(ELF);
+            println!("{vkey_hex}");
+        }
+
+        cli::Commands::VkeySelector => {
+            let vkey_selector_hex =
+                hex::encode(pessimistic_proof::core::PESSIMISTIC_PROOF_PROGRAM_SELECTOR);
+            println!("0x{vkey_selector_hex}");
         }
 
         cli::Commands::Backup(cli::Backup::List { config_path: cfg }) => {
@@ -49,7 +55,7 @@ fn main() -> anyhow::Result<()> {
             if let BackupConfig::Enabled { path, .. } = cfg.storage.backup {
                 match agglayer_storage::storage::backup::BackupEngine::list_backups(&path) {
                     Ok(result) => println!("{}", serde_json::to_string(&result).unwrap()),
-                    Err(error) => eprintln!("{}", error),
+                    Err(error) => eprintln!("{error}"),
                 }
             }
         }

@@ -1,15 +1,16 @@
-use bincode::config::Options;
-use pessimistic_proof::NetworkState;
 pub use pessimistic_proof::PessimisticProofOutput;
-use sp1_sdk::SP1PublicValues;
+use pessimistic_proof::{
+    keccak::{Hasher, Keccak256Hasher},
+    NetworkState,
+};
 pub use sp1_sdk::{ExecutionReport, SP1Proof};
-use sp1_sdk::{SP1ProofWithPublicValues, SP1Stdin, SP1VerifyingKey};
+use sp1_sdk::{SP1ProofWithPublicValues, SP1PublicValues, SP1Stdin, SP1VerifyingKey};
 
 use crate::PESSIMISTIC_PROOF_ELF;
 
-pub type Hasher = pessimistic_proof::local_exit_tree::hasher::Keccak256Hasher;
-pub type Digest = <Hasher as pessimistic_proof::local_exit_tree::hasher::Hasher>::Digest;
-pub type MultiBatchHeader = pessimistic_proof::multi_batch_header::MultiBatchHeader<Hasher>;
+pub type KeccakHasher = Keccak256Hasher;
+pub type Digest = <KeccakHasher as Hasher>::Digest;
+pub type MultiBatchHeader = pessimistic_proof::multi_batch_header::MultiBatchHeader<KeccakHasher>;
 
 pub struct ProofOutput {}
 
@@ -45,7 +46,7 @@ impl Runner {
 
     /// Extract outputs from the committed public values.
     pub fn extract_output(public_vals: SP1PublicValues) -> PessimisticProofOutput {
-        PessimisticProofOutput::bincode_options()
+        PessimisticProofOutput::bincode_codec()
             .deserialize(public_vals.as_slice())
             .expect("deser")
     }

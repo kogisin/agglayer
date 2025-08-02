@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use pessimistic_proof::bridge_exit::BridgeExit;
+use agglayer_types::PessimisticRootInput;
+use pessimistic_proof::unified_bridge::{BridgeExit, CommitmentVersion};
 use pessimistic_proof_test_suite::{forest::Forest, runner::Runner, sample_data as data};
 
 #[rstest::rstest]
@@ -23,7 +24,9 @@ fn cycles_on_sample_inputs(
     bridge_exits: impl IntoIterator<Item = BridgeExit>,
 ) {
     let old_state = state.local_state();
-    let certificate = state.clone().apply_bridge_exits([], bridge_exits);
+    let certificate = state
+        .clone()
+        .apply_bridge_exits([], bridge_exits, CommitmentVersion::V2);
 
     let multi_batch_header = state
         .state_b
@@ -31,6 +34,8 @@ fn cycles_on_sample_inputs(
             &certificate,
             state.get_signer(),
             certificate.l1_info_root().unwrap().unwrap_or_default(),
+            PessimisticRootInput::Computed(CommitmentVersion::V2),
+            None,
         )
         .unwrap();
 

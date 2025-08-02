@@ -1,7 +1,9 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use agglayer_contracts::{L1TransactionFetcher, RollupContract};
 use agglayer_storage::stores::{
@@ -11,8 +13,8 @@ use agglayer_storage::stores::{
 use agglayer_types::{
     Certificate, CertificateHeader, CertificateId, EpochConfiguration, NetworkId,
 };
+use alloy::{primitives::B256, providers::Provider};
 use error::{Error, RpcResult};
-use ethers::{providers::Middleware, types::H256};
 use futures::FutureExt;
 use hyper::StatusCode;
 use jsonrpsee::{
@@ -20,8 +22,7 @@ use jsonrpsee::{
     proc_macros::rpc,
     server::{HttpBody, PingConfig, ServerBuilder},
 };
-use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
+use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use tracing::info;
 
 use crate::{service::AgglayerService, signed_tx::SignedTx};
@@ -44,10 +45,10 @@ pub mod admin;
 #[rpc(server, namespace = "interop")]
 trait Agglayer {
     #[method(name = "sendTx")]
-    async fn send_tx(&self, tx: SignedTx) -> RpcResult<H256>;
+    async fn send_tx(&self, tx: SignedTx) -> RpcResult<B256>;
 
     #[method(name = "getTxStatus")]
-    async fn get_tx_status(&self, hash: H256) -> RpcResult<TxStatus>;
+    async fn get_tx_status(&self, hash: B256) -> RpcResult<TxStatus>;
 
     #[method(name = "sendCertificate")]
     async fn send_certificate(&self, certificate: Certificate) -> RpcResult<CertificateId>;
@@ -113,7 +114,7 @@ impl<V0Rpc, Rpc, PendingStore, StateStore, DebugStore> Drop
 impl<V0Rpc, Rpc, PendingStore, StateStore, DebugStore>
     AgglayerImpl<V0Rpc, Rpc, PendingStore, StateStore, DebugStore>
 where
-    V0Rpc: Middleware + 'static,
+    V0Rpc: Provider + Clone + 'static,
     Rpc: RollupContract + L1TransactionFetcher + 'static + Send + Sync,
     PendingStore: PendingCertificateWriter + PendingCertificateReader + 'static,
     StateStore: StateReader + StateWriter + 'static,
@@ -188,22 +189,28 @@ where
 impl<V0Rpc, Rpc, PendingStore, StateStore, DebugStore> AgglayerServer
     for AgglayerImpl<V0Rpc, Rpc, PendingStore, StateStore, DebugStore>
 where
-    V0Rpc: Middleware + 'static,
+    V0Rpc: Provider + Clone + 'static,
     Rpc: RollupContract + L1TransactionFetcher + 'static + Send + Sync,
     PendingStore: PendingCertificateWriter + PendingCertificateReader + 'static,
     StateStore: StateReader + StateWriter + 'static,
     DebugStore: DebugReader + DebugWriter + 'static,
 {
-    async fn send_tx(&self, tx: SignedTx) -> RpcResult<H256> {
+    async fn send_tx(&self, tx: SignedTx) -> RpcResult<B256> {
         Ok(self.service.send_tx(tx).await?)
     }
 
-    async fn get_tx_status(&self, hash: H256) -> RpcResult<TxStatus> {
+    async fn get_tx_status(&self, hash: B256) -> RpcResult<TxStatus> {
         Ok(self.service.get_tx_status(hash).await?.to_string())
     }
 
     async fn send_certificate(&self, certificate: Certificate) -> RpcResult<CertificateId> {
-        Ok(self.rpc_service.send_certificate(certificate).await?)
+        // NOTE: Extra certificate signature is not supported on the json rpc api
+        let extra_signature = None;
+
+        Ok(self
+            .rpc_service
+            .send_certificate(certificate, extra_signature)
+            .await?)
     }
 
     async fn get_certificate_header(

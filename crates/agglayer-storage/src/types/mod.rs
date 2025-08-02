@@ -1,4 +1,6 @@
-use agglayer_types::{CertificateHeader, CertificateId, Digest, NetworkId, Proof};
+use agglayer_types::{
+    primitives::Digest, CertificateHeader, CertificateId, CertificateIndex, EpochNumber, Height, NetworkId, Proof
+};
 use serde::{Deserialize, Serialize};
 
 use crate::columns::Codec;
@@ -14,13 +16,13 @@ macro_rules! default_codec_impl {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MetadataKey {
     LatestSettledEpoch,
-    EpochSynchronization,
+    EpochSynchronization, // Actually unused, kept for storage backward compatibility
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MetadataValue {
-    LatestSettledEpoch(u64),
-    EpochSynchronization(u64),
+    LatestSettledEpoch(EpochNumber),
+    EpochSynchronization(u64), // Actually unused, kept for storage backward compatibility
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +62,10 @@ default_codec_impl!(
     u64,
     u32,
     CertificateId,
+    CertificateIndex,
     CertificateHeader,
+    Digest,
+    Height,
     MetadataKey,
     MetadataValue,
     NetworkId,

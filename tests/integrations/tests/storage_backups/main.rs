@@ -8,8 +8,7 @@ use integrations::{
     agglayer_setup::{setup_network, start_agglayer},
     wait_for_settlement_or_error,
 };
-use jsonrpsee::core::client::ClientT as _;
-use jsonrpsee::rpc_params;
+use jsonrpsee::{core::client::ClientT as _, rpc_params};
 use pessimistic_proof_test_suite::forest::Forest;
 use rstest::rstest;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +48,10 @@ async fn recover_with_backup(#[case] state: Forest) {
     let result = wait_for_settlement_or_error!(client, certificate_id).await;
 
     assert_eq!(result.status, CertificateStatus::Settled);
+
+    // Awaiting for the backup to be created in the background
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
     handle.cancel();
     _ = agglayer_shutdowned.await;
 
@@ -84,6 +87,8 @@ async fn recover_with_backup(#[case] state: Forest) {
 #[timeout(Duration::from_secs(360))]
 #[case::type_0_ecdsa(common::type_0_ecdsa_forest())]
 async fn purge_after_n_backup(#[case] state: Forest) {
+    use agglayer_types::Height;
+
     let tmp_dir = TempDBDir::new();
     let backup_dir = TempDBDir::new();
 
@@ -107,7 +112,7 @@ async fn purge_after_n_backup(#[case] state: Forest) {
 
     let certificate = state.clone().apply_events(&[], &withdrawals);
     let mut certificate2 = state.clone().apply_events(&[], &[]);
-    certificate2.height = 1;
+    certificate2.height = Height::new(1);
 
     let certificate_id: CertificateId = client
         .request("interop_sendCertificate", rpc_params![certificate])
@@ -126,6 +131,9 @@ async fn purge_after_n_backup(#[case] state: Forest) {
     let result = wait_for_settlement_or_error!(client, certificate_id2).await;
 
     assert_eq!(result.status, CertificateStatus::Settled);
+
+    // Awaiting for the backup to be created in the background
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     handle.cancel();
     _ = agglayer_shutdowned.await;
@@ -174,6 +182,8 @@ async fn purge_after_n_backup(#[case] state: Forest) {
 #[timeout(Duration::from_secs(360))]
 #[case::type_0_ecdsa(common::type_0_ecdsa_forest())]
 async fn report_contains_all_backups(#[case] state: Forest) {
+    use agglayer_types::Height;
+
     let tmp_dir = TempDBDir::new();
     let backup_dir = TempDBDir::new();
 
@@ -193,7 +203,7 @@ async fn report_contains_all_backups(#[case] state: Forest) {
 
     let certificate = state.clone().apply_events(&[], &withdrawals);
     let mut certificate2 = state.clone().apply_events(&[], &[]);
-    certificate2.height = 1;
+    certificate2.height = Height::new(1);
 
     let certificate_id: CertificateId = client
         .request("interop_sendCertificate", rpc_params![certificate])
@@ -212,6 +222,9 @@ async fn report_contains_all_backups(#[case] state: Forest) {
     let result = wait_for_settlement_or_error!(client, certificate_id2).await;
 
     assert_eq!(result.status, CertificateStatus::Settled);
+
+    // Awaiting for the backup to be created in the background
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     handle.cancel();
     _ = agglayer_shutdowned.await;
@@ -263,6 +276,8 @@ async fn report_contains_all_backups(#[case] state: Forest) {
 #[timeout(Duration::from_secs(360))]
 #[case::type_0_ecdsa(common::type_0_ecdsa_forest())]
 async fn restore_at_particular_level(#[case] state: Forest) {
+    use agglayer_types::Height;
+
     let tmp_dir = TempDBDir::new();
     let backup_dir = TempDBDir::new();
 
@@ -282,7 +297,7 @@ async fn restore_at_particular_level(#[case] state: Forest) {
 
     let certificate = state.clone().apply_events(&[], &withdrawals);
     let mut certificate2 = state.clone().apply_events(&[], &[]);
-    certificate2.height = 1;
+    certificate2.height = Height::new(1);
 
     let certificate_id: CertificateId = client
         .request("interop_sendCertificate", rpc_params![certificate])
@@ -301,6 +316,9 @@ async fn restore_at_particular_level(#[case] state: Forest) {
     let result = wait_for_settlement_or_error!(client, certificate_id2).await;
 
     assert_eq!(result.status, CertificateStatus::Settled);
+
+    // Awaiting for the backup to be created in the background
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     handle.cancel();
     _ = agglayer_shutdowned.await;
@@ -336,7 +354,7 @@ async fn restore_at_particular_level(#[case] state: Forest) {
         .request("interop_getCertificateHeader", rpc_params![certificate_id2])
         .await;
 
-    let expected_message = format!("Resource not found: Certificate({:#})", certificate_id2);
+    let expected_message = format!("Resource not found: Certificate({certificate_id2:#})");
 
     assert!(
         matches!(error.unwrap_err(), jsonrpsee::core::ClientError::Call(obj) if obj.message() == expected_message)

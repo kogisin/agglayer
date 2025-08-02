@@ -12,3 +12,6 @@ lint:
 breaking:
   use:
     - FILE
+
+deps:
+  - buf.build/agglayer/interop:v0.4.0

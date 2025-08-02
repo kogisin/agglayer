@@ -5,14 +5,13 @@ use agglayer_storage::{
     tests::TempDBDir,
 };
 use agglayer_test_suite::{new_storage, sample_data::USDC, Forest};
-use ethers::types::H256;
 use mockall::predicate::{always, eq};
-use pessimistic_proof::LocalNetworkState;
+use pessimistic_proof::{core::generate_pessimistic_proof, LocalNetworkState};
 use rstest::rstest;
 
 use super::*;
 use crate::{
-    epoch_packer::MockEpochPacker,
+    settlement_client::MockSettlementClient,
     tests::{clock, mocks::MockCertifier},
 };
 
@@ -37,7 +36,7 @@ async fn from_pending_to_settle() {
     let certificate_id = certificate.hash();
     storage
         .pending
-        .insert_pending_certificate(network_id, 0, &certificate)
+        .insert_pending_certificate(network_id, Height::ZERO, &certificate)
         .expect("unable to insert certificate in pending");
 
     storage
@@ -49,7 +48,7 @@ async fn from_pending_to_settle() {
     certifier
         .expect_certify()
         .times(1)
-        .with(always(), eq(network_id), eq(0))
+        .with(always(), eq(network_id), eq(Height::ZERO))
         .returning(move |mut new_state, network, height| {
             let certificate = pending_store
                 .get_certificate(network, height)
@@ -65,6 +64,8 @@ async fn from_pending_to_settle() {
                         .l1_info_root()
                         .expect("Failed to get L1 info root")
                         .unwrap_or_default(),
+                    PessimisticRootInput::Computed(CommitmentVersion::V2),
+                    None,
                 )
                 .expect("Failed to apply certificate");
 
@@ -76,28 +77,23 @@ async fn from_pending_to_settle() {
             })
         });
 
-    let mut packer = MockEpochPacker::new();
-    let state_store = Arc::clone(&storage.state);
-    packer
-        .expect_settle_certificate()
+    let mut settlement_client = MockSettlementClient::new();
+    settlement_client
+        .expect_submit_certificate_settlement()
         .once()
         .withf(move |i| *i == certificate_id)
-        .returning(move |c| {
-            state_store
-                .update_settlement_tx_hash(&c, Digest::ZERO)
-                .unwrap();
-            state_store
-                .update_certificate_header_status(&c, &CertificateStatus::Settled)
-                .unwrap();
-
-            Ok((network_id, SettledCertificate(c, 0, 0, 0)))
-        });
+        .returning(move |_| Ok(SettlementTxHash::for_tests()));
+    settlement_client
+        .expect_wait_for_settlement()
+        .once()
+        .withf(move |t, i| *t == SettlementTxHash::for_tests() && *i == certificate_id)
+        .returning(move |_, _| Ok((EpochNumber::ZERO, CertificateIndex::ZERO)));
 
     let mut task = NetworkTask::new(
         Arc::clone(&storage.pending),
         Arc::clone(&storage.state),
         Arc::new(certifier),
-        Arc::new(packer),
+        Arc::new(settlement_client),
         clock_ref.clone(),
         network_id,
         certificate_stream,
@@ -105,13 +101,18 @@ async fn from_pending_to_settle() {
     .expect("Failed to create a new network task");
 
     let mut epochs = task.clock_ref.subscribe().unwrap();
-    let mut next_expected_height = 0;
+    let mut next_expected_height = Height::ZERO;
     let mut first_run = true;
-    task.make_progress(&mut epochs, &mut next_expected_height, &mut first_run)
-        .await
-        .unwrap();
+    task.make_progress(
+        &mut epochs,
+        &mut next_expected_height,
+        &mut first_run,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(next_expected_height, 1);
+    assert_eq!(next_expected_height, Height::new(1));
 
     let header = storage
         .state
@@ -125,7 +126,7 @@ async fn from_pending_to_settle() {
 #[rstest]
 #[test_log::test(tokio::test)]
 #[timeout(Duration::from_secs(2))]
-async fn from_proven_to_settle() {
+async fn from_proven_to_settled() {
     let tmp = TempDBDir::new();
     let storage = new_storage(&tmp.path);
 
@@ -143,7 +144,7 @@ async fn from_proven_to_settle() {
     let certificate_id = certificate.hash();
     storage
         .pending
-        .insert_pending_certificate(network_id, 0, &certificate)
+        .insert_pending_certificate(network_id, Height::ZERO, &certificate)
         .expect("unable to insert certificate in pending");
 
     storage
@@ -155,14 +156,14 @@ async fn from_proven_to_settle() {
     certifier
         .expect_certify()
         .times(1)
-        .with(always(), eq(network_id), eq(0))
+        .with(always(), eq(network_id), eq(Height::ZERO))
         .returning(move |mut new_state, network, height| {
             let certificate = pending_store
                 .get_certificate(network, height)
                 .expect("Failed to get certificate")
                 .expect("Certificate not found");
-
             let signer = agglayer_types::Address::new([0; 20]);
+
             let _ = new_state
                 .apply_certificate(
                     &certificate,
@@ -171,6 +172,8 @@ async fn from_proven_to_settle() {
                         .l1_info_root()
                         .expect("Failed to get L1 info root")
                         .unwrap_or_default(),
+                    PessimisticRootInput::Computed(CommitmentVersion::V2),
+                    None,
                 )
                 .expect("Failed to apply certificate");
 
@@ -182,28 +185,23 @@ async fn from_proven_to_settle() {
             })
         });
 
-    let mut packer = MockEpochPacker::new();
-    let state_store = Arc::clone(&storage.state);
-    packer
-        .expect_settle_certificate()
+    let mut settlement_client = MockSettlementClient::new();
+    settlement_client
+        .expect_submit_certificate_settlement()
         .once()
         .withf(move |i| *i == certificate_id)
-        .returning(move |c| {
-            state_store
-                .update_settlement_tx_hash(&c, Digest::ZERO)
-                .unwrap();
-            state_store
-                .update_certificate_header_status(&c, &CertificateStatus::Settled)
-                .unwrap();
-
-            Ok((network_id, SettledCertificate(c, 0, 0, 0)))
-        });
+        .returning(move |_| Ok(SettlementTxHash::for_tests()));
+    settlement_client
+        .expect_wait_for_settlement()
+        .once()
+        .withf(move |t, i| *t == SettlementTxHash::for_tests() && *i == certificate_id)
+        .returning(move |_, _| Ok((EpochNumber::ZERO, CertificateIndex::ZERO)));
 
     let mut task = NetworkTask::new(
         Arc::clone(&storage.pending),
         Arc::clone(&storage.state),
         Arc::new(certifier),
-        Arc::new(packer),
+        Arc::new(settlement_client),
         clock_ref.clone(),
         network_id,
         certificate_stream,
@@ -211,13 +209,18 @@ async fn from_proven_to_settle() {
     .expect("Failed to create a new network task");
 
     let mut epochs = task.clock_ref.subscribe().unwrap();
-    let mut next_expected_height = 0;
+    let mut next_expected_height = Height::ZERO;
     let mut first_run = true;
-    task.make_progress(&mut epochs, &mut next_expected_height, &mut first_run)
-        .await
-        .unwrap();
+    task.make_progress(
+        &mut epochs,
+        &mut next_expected_height,
+        &mut first_run,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(next_expected_height, 1);
+    assert_eq!(next_expected_height, Height::new(1));
 
     let header = storage
         .state
@@ -250,7 +253,7 @@ async fn from_candidate_to_settle() {
     let certificate_id = certificate.hash();
     storage
         .pending
-        .insert_pending_certificate(network_id, 0, &certificate)
+        .insert_pending_certificate(network_id, Height::ZERO, &certificate)
         .expect("unable to insert certificate in pending");
 
     storage
@@ -260,48 +263,47 @@ async fn from_candidate_to_settle() {
 
     storage
         .state
-        .update_settlement_tx_hash(&certificate_id, Digest::ZERO)
+        .update_settlement_tx_hash(&certificate_id, SettlementTxHash::for_tests())
         .unwrap();
 
     certifier.expect_certify().never();
     certifier
-        .expect_witness_execution()
+        .expect_witness_generation()
         .withf(move |c, _| c.hash() == certificate_id)
         .once()
         .returning(move |cert, state| {
             let initial = LocalNetworkState::from(state.clone());
             let l1_info_root = cert.l1_info_root().unwrap().unwrap_or_default();
 
-            let batch = state.apply_certificate(cert, signer, l1_info_root).unwrap();
-
-            Ok((batch, initial))
-        });
-
-    let state_store = storage.state.clone();
-    let mut packer = MockEpochPacker::new();
-    packer.expect_settle_certificate().never();
-    packer
-        .expect_recover_settlement()
-        .with(eq(H256::zero()), eq(certificate_id), eq(network_id), eq(0))
-        .once()
-        .returning(move |_, certificate_id, network_id, height| {
-            state_store
-                .update_certificate_header_status(&certificate_id, &CertificateStatus::Settled)
+            let batch = state
+                .apply_certificate(
+                    cert,
+                    signer,
+                    l1_info_root,
+                    PessimisticRootInput::Computed(CommitmentVersion::V2),
+                    None,
+                )
                 .unwrap();
 
-            Ok((network_id, SettledCertificate(certificate_id, height, 0, 0)))
+            let (pv, _) = generate_pessimistic_proof(initial.clone().into(), &batch).unwrap();
+            Ok((batch, initial, pv))
         });
-    packer
-        .expect_transaction_exists()
+
+    let mut settlement_client = MockSettlementClient::new();
+    settlement_client
+        .expect_submit_certificate_settlement()
+        .never();
+    settlement_client
+        .expect_wait_for_settlement()
+        .with(eq(SettlementTxHash::for_tests()), eq(certificate_id))
         .once()
-        .with(eq(H256::zero()))
-        .returning(|_| Ok(true));
+        .returning(move |_, _| Ok((EpochNumber::ZERO, CertificateIndex::ZERO)));
 
     let mut task = NetworkTask::new(
         Arc::clone(&storage.pending),
         Arc::clone(&storage.state),
         Arc::new(certifier),
-        Arc::new(packer),
+        Arc::new(settlement_client),
         clock_ref.clone(),
         network_id,
         certificate_stream,
@@ -309,13 +311,18 @@ async fn from_candidate_to_settle() {
     .expect("Failed to create a new network task");
 
     let mut epochs = task.clock_ref.subscribe().unwrap();
-    let mut next_expected_height = 0;
+    let mut next_expected_height = Height::ZERO;
     let mut first_run = true;
-    task.make_progress(&mut epochs, &mut next_expected_height, &mut first_run)
-        .await
-        .unwrap();
+    task.make_progress(
+        &mut epochs,
+        &mut next_expected_height,
+        &mut first_run,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(next_expected_height, 1);
+    assert_eq!(next_expected_height, Height::new(1));
 
     let header = storage
         .state
@@ -351,18 +358,19 @@ async fn from_settle_to_settle() {
         .expect("Failed to insert certificate header");
 
     certifier.expect_certify().never();
-    certifier.expect_witness_execution().never();
+    certifier.expect_witness_generation().never();
 
-    let mut packer = MockEpochPacker::new();
-    packer.expect_settle_certificate().never();
-    packer.expect_recover_settlement().never();
-    packer.expect_transaction_exists().never();
+    let mut settlement_client = MockSettlementClient::new();
+    settlement_client
+        .expect_submit_certificate_settlement()
+        .never();
+    settlement_client.expect_wait_for_settlement().never();
 
     let mut task = NetworkTask::new(
         Arc::clone(&storage.pending),
         Arc::clone(&storage.state),
         Arc::new(certifier),
-        Arc::new(packer),
+        Arc::new(settlement_client),
         clock_ref.clone(),
         network_id,
         certificate_stream,
@@ -370,13 +378,18 @@ async fn from_settle_to_settle() {
     .expect("Failed to create a new network task");
 
     let mut epochs = task.clock_ref.subscribe().unwrap();
-    let mut next_expected_height = 1;
+    let mut next_expected_height = Height::new(1);
     let mut first_run = true;
-    task.make_progress(&mut epochs, &mut next_expected_height, &mut first_run)
-        .await
-        .unwrap();
+    task.make_progress(
+        &mut epochs,
+        &mut next_expected_height,
+        &mut first_run,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(next_expected_height, 1);
+    assert_eq!(next_expected_height, Height::new(1));
 
     let header = storage
         .state

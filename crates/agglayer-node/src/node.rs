@@ -1,16 +1,13 @@
 use std::{num::NonZeroU64, sync::Arc};
 
-use agglayer_aggregator_notifier::{CertifierClient, EpochPackerClient};
+use agglayer_aggregator_notifier::{CertifierClient, RpcSettlementClient};
 use agglayer_certificate_orchestrator::CertificateOrchestrator;
 use agglayer_clock::{BlockClock, Clock, TimeClock};
 use agglayer_config::{storage::backup::BackupConfig, Config, Epoch};
-use agglayer_contracts::{
-    polygon_rollup_manager::PolygonRollupManager,
-    polygon_zkevm_global_exit_root_v2::PolygonZkEVMGlobalExitRootV2, L1RpcClient,
+use agglayer_contracts::{contracts::PolygonRollupManager, L1RpcClient};
+use agglayer_jsonrpc_api::{
+    admin::AdminAgglayerImpl, kernel::Kernel, service::AgglayerService, AgglayerImpl,
 };
-use agglayer_jsonrpc_api::admin::AdminAgglayerImpl;
-use agglayer_jsonrpc_api::service::AgglayerService;
-use agglayer_jsonrpc_api::{kernel::Kernel, AgglayerImpl};
 use agglayer_signer::ConfiguredSigner;
 use agglayer_storage::{
     storage::{
@@ -22,13 +19,12 @@ use agglayer_storage::{
         PerEpochReader as _,
     },
 };
-use alloy::providers::WsConnect;
-use anyhow::Result;
-use ethers::{
-    middleware::MiddlewareBuilder,
-    providers::{Http, Provider},
+use alloy::{
+    network::EthereumWallet,
+    providers::{ProviderBuilder, WsConnect},
     signers::Signer,
 };
+use anyhow::Result;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -191,22 +187,20 @@ impl Node {
         let address = signer.address();
         tracing::info!("Signer address: {:?}", address);
 
-        // Create a new L1 RPC provider with the configured signer.
-        let rpc = Arc::new(
-            Provider::<Http>::try_from(config.l1.node_url.as_str())?
-                .with_signer(signer)
-                .nonce_manager(address),
-        );
+        // Create a new L1 RPC provider with signer support
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .on_http(config.l1.node_url.clone());
+        let rpc = Arc::new(provider);
 
         tracing::debug!("RPC provider created");
         let rollup_manager = Arc::new(
             L1RpcClient::try_new(
                 rpc.clone(),
-                PolygonRollupManager::new(config.l1.rollup_manager_contract, rpc.clone()),
-                PolygonZkEVMGlobalExitRootV2::new(
-                    config.l1.polygon_zkevm_global_exit_root_v2_contract,
-                    rpc.clone(),
-                ),
+                PolygonRollupManager::new(config.l1.rollup_manager_contract.into(), (*rpc).clone()),
+                config.l1.polygon_zkevm_global_exit_root_v2_contract.into(),
+                config.outbound.rpc.settle.gas_multiplier_factor,
             )
             .await?,
         );
@@ -225,13 +219,13 @@ impl Node {
         let core = Kernel::new(rpc.clone(), config.clone());
 
         let current_epoch_store = Arc::new(arc_swap::ArcSwap::new(Arc::new(current_epoch_store)));
-        let epoch_packing_aggregator_task = EpochPackerClient::try_new(
+        let epoch_packing_aggregator_task = RpcSettlementClient::new(
             Arc::new(config.outbound.rpc.settle.clone()),
             state_store.clone(),
             pending_store.clone(),
             Arc::clone(&rollup_manager),
             current_epoch_store.clone(),
-        )?;
+        );
 
         info!("Epoch packing aggregator task created.");
 
@@ -245,7 +239,7 @@ impl Node {
             .clock(clock_ref)
             .data_receiver(data_receiver)
             .cancellation_token(cancellation_token.clone())
-            .epoch_packing_task_builder(epoch_packing_aggregator_task)
+            .settlement_client(epoch_packing_aggregator_task)
             .pending_store(pending_store.clone())
             .epochs_store(epochs_store.clone())
             .current_epoch(current_epoch_store)
@@ -281,25 +275,28 @@ impl Node {
             .start()
             .await?;
 
-        let grpc_router = agglayer_grpc_api::Server::with_config(config.clone(), rpc_service)
-            .build()
-            .map_err(|err| {
-                error!("Failed to build gRPC router: {}", err);
-                err
-            })?;
+        let public_grpc_router =
+            agglayer_grpc_api::Server::with_config(config.clone(), rpc_service)
+                .build()
+                .inspect_err(|err| error!(?err, "Failed to build public gRPC router"))?;
 
         let health_router = api::rest::health_router();
 
-        let router = axum::Router::new()
+        let readrpc_router = axum::Router::new()
             .merge(health_router)
-            .merge(json_rpc_router)
-            .nest("/grpc", grpc_router);
+            .merge(json_rpc_router);
 
-        let listener = tokio::net::TcpListener::bind(config.rpc_addr()).await?;
+        let readrpc_listener = tokio::net::TcpListener::bind(config.readrpc_addr()).await?;
+        let public_grpc_listener = tokio::net::TcpListener::bind(config.public_grpc_addr()).await?;
         let admin_listener = tokio::net::TcpListener::bind(config.admin_rpc_addr()).await?;
-        info!(on = %config.rpc_addr(), "API listening");
+        info!(on = %config.readrpc_addr(), "ReadRPC listening");
+        info!(on = %config.public_grpc_addr(), "Public gRPC listening");
+        info!(on = %config.admin_rpc_addr(), "AdminRPC listening");
 
-        let api_server = axum::serve(listener, router)
+        let readrpc_server = axum::serve(readrpc_listener, readrpc_router)
+            .with_graceful_shutdown(cancellation_token.clone().cancelled_owned());
+
+        let public_grpc_server = axum::serve(public_grpc_listener, public_grpc_router)
             .with_graceful_shutdown(cancellation_token.clone().cancelled_owned());
 
         let admin_server = axum::serve(admin_listener, admin_router)
@@ -307,7 +304,8 @@ impl Node {
 
         let rpc_handle = tokio::spawn(async move {
             tokio::select! {
-                _ = api_server => {},
+                _ = readrpc_server => {},
+                _ = public_grpc_server => {},
                 _ = admin_server => {},
                 _ = cancellation_token.cancelled() => {
                     debug!("Node RPC shutdown requested.");

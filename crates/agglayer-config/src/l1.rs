@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ethers::types::Address;
+use agglayer_primitives::Address;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -22,8 +22,6 @@ pub struct L1 {
     #[serde(alias = "PolygonZkEVMGlobalExitRootV2Contract")]
     pub polygon_zkevm_global_exit_root_v2_contract: Address,
 
-    pub aggchain_base_contract: Address,
-
     #[serde(default = "L1::default_rpc_timeout")]
     #[serde(with = "crate::with::HumanDuration")]
     pub rpc_timeout: Duration,
@@ -44,9 +42,6 @@ impl Default for L1 {
             max_reconnection_elapsed_time: default_max_reconnection_elapsed_time(),
             ws_node_url: default_ws_node_url(),
             rollup_manager_contract: "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
-                .parse()
-                .unwrap(),
-            aggchain_base_contract: "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e"
                 .parse()
                 .unwrap(),
             polygon_zkevm_global_exit_root_v2_contract:

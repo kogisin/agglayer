@@ -3,10 +3,10 @@
 //! The agglayer is configured via its TOML configuration file, `agglayer.toml`
 //! by default, which is deserialized into the [`Config`] struct.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, str::FromStr};
 
+use agglayer_primitives::Address;
 use agglayer_prover_config::GrpcConfig;
-use ethers::types::Address;
 use outbound::OutboundConfig;
 use serde::{de::DeserializeSeed, Deserialize, Serialize};
 use serde_with::DisplayFromStr;
@@ -62,21 +62,27 @@ pub struct Config {
     #[serde_as(as = "HashMap<DisplayFromStr, _>")]
     #[serde(default)]
     pub proof_signers: HashMap<u32, Address>,
+
     /// The log configuration.
     #[serde(default)]
     pub log: Log,
+
     /// The local RPC server configuration.
     #[serde(default)]
     pub rpc: RpcConfig,
+
     /// Rate limiting configuration.
     #[serde(default)]
     pub rate_limiting: RateLimitingConfig,
+
     /// The configuration for every outbound network component.
     #[serde(default)]
     pub outbound: OutboundConfig,
+
     /// The L1 configuration.
     #[serde(default)]
     pub l1: L1,
+
     /// The authentication configuration.
     #[serde(default)]
     pub auth: AuthConfig,
@@ -119,6 +125,14 @@ pub struct Config {
 
     #[serde(default, skip_serializing_if = "crate::is_default")]
     pub grpc: GrpcConfig,
+
+    /// Extra Certificate signer per network.
+    /// Signatures is expected to be performed on the same commitment as
+    /// the certificate signature, which is the V2 commitment for now.
+    #[serde(default)]
+    #[serde_as(as = "HashMap<DisplayFromStr, _>")]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub extra_certificate_signer: HashMap<u32, Address>,
 }
 
 impl Config {
@@ -171,12 +185,18 @@ impl Config {
             debug_mode: false,
             mock_verifier: false,
             grpc: Default::default(),
+            extra_certificate_signer: Default::default(),
         }
     }
 
-    /// Get the target RPC socket address from the configuration.
-    pub fn rpc_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::from((self.rpc.host, self.rpc.port))
+    /// Get the target ReadRPC socket address from the configuration.
+    pub fn readrpc_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((self.rpc.host, self.rpc.readrpc_port))
+    }
+
+    /// Get the target gRPC socket address from the configuration.
+    pub fn public_grpc_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((self.rpc.host, self.rpc.grpc_port))
     }
 
     /// Get the admin RPC socket address from the configuration.
@@ -233,8 +253,7 @@ impl<'de> DeserializeSeed<'de> for ConfigDeserializer<'_> {
                 .storage
                 .path_contextualized(&self.path.canonicalize().map_err(|error| {
                     serde::de::Error::custom(format!(
-                        "Unable to canonicalize the storage path: {}",
-                        error
+                        "Unable to canonicalize the storage path: {error}"
                     ))
                 })?);
 
@@ -250,4 +269,12 @@ fn is_false(b: &bool) -> bool {
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == Default::default()
+}
+
+/// Get an environment variable or a default value if it is not set.
+fn from_env_or_default<T: FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
