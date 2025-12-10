@@ -7,6 +7,7 @@ use alloy::{
     providers::{mock::Asserter, ProviderBuilder},
     signers::local::LocalSigner,
 };
+use futures::TryFutureExt;
 use jsonrpsee_test_utils::{helpers::ok_response, mocks::Id, TimeoutFutureExt as _};
 
 use crate::{
@@ -34,9 +35,9 @@ async fn interop_executor_check_tx() {
     config.full_node_rpcs.insert(1, uri.parse().unwrap());
 
     let asserter = Asserter::new();
-    let provider = ProviderBuilder::new().on_mocked_client(asserter);
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-    let kernel = Kernel::new(Arc::new(provider), Arc::new(config));
+    let kernel = Kernel::new(Arc::new(provider), Arc::new(config)).unwrap();
 
     let mut signed_tx = signed_tx();
 
@@ -69,10 +70,10 @@ async fn interop_executor_verify_zkp() {
     let config = Arc::new(config);
 
     let asserter = Asserter::new();
-    let provider = ProviderBuilder::new().on_mocked_client(asserter.clone());
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
 
     let _l1 = config.l1.clone();
-    let kernel = Kernel::new(Arc::new(provider), config);
+    let kernel = Kernel::new(Arc::new(provider), config).unwrap();
 
     let signed_tx = signed_tx();
 
@@ -90,7 +91,10 @@ async fn interop_executor_verify_zkp() {
     // proof_signers optimization works correctly.
 
     // Execute the function under test
-    let result = kernel.verify_batches_trusted_aggregator(&signed_tx).await;
+    let result = kernel
+        .verify_batches_trusted_aggregator(&signed_tx)
+        .and_then(|call| async move { call.send().await })
+        .await;
 
     // In a real implementation, with proper mocks, this should succeed
     // For now, we verify that we get a specific error indicating the mock
@@ -149,8 +153,8 @@ async fn verify_cert_signature() {
     let config = Arc::new(config);
 
     let asserter = Asserter::new();
-    let provider = ProviderBuilder::new().on_mocked_client(asserter);
-    let kernel = Kernel::new(Arc::new(provider), config);
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    let kernel = Kernel::new(Arc::new(provider), config).unwrap();
 
     {
         // valid signature
@@ -229,9 +233,9 @@ mod interop_executor_execute {
         config.full_node_rpcs.insert(1, uri.parse().unwrap());
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().on_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let kernel = Kernel::new(Arc::new(provider), Arc::new(config));
+        let kernel = Kernel::new(Arc::new(provider), Arc::new(config)).unwrap();
 
         assert!(kernel.verify_proof_zkevm_node(&signed_tx).await.is_ok());
     }
@@ -255,9 +259,9 @@ mod interop_executor_execute {
         config.full_node_rpcs.insert(1, uri.parse().unwrap());
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().on_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let kernel = Kernel::new(Arc::new(provider), Arc::new(config));
+        let kernel = Kernel::new(Arc::new(provider), Arc::new(config)).unwrap();
 
         assert!(matches!(
             kernel.verify_proof_zkevm_node(&signed_tx).await,
@@ -288,9 +292,9 @@ mod interop_executor_execute {
         config.full_node_rpcs.insert(1, uri.parse().unwrap());
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().on_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let kernel = Kernel::new(Arc::new(provider), Arc::new(config));
+        let kernel = Kernel::new(Arc::new(provider), Arc::new(config)).unwrap();
 
         assert!(matches!(
             kernel.verify_proof_zkevm_node(&signed_tx).await,
@@ -322,9 +326,9 @@ mod interop_executor_execute {
         config.full_node_rpcs.insert(1, uri.parse().unwrap());
 
         let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().on_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let kernel = Kernel::new(Arc::new(provider), Arc::new(config));
+        let kernel = Kernel::new(Arc::new(provider), Arc::new(config)).unwrap();
 
         assert!(matches!(
             kernel.verify_proof_zkevm_node(&signed_tx).await,

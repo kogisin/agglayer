@@ -7,10 +7,24 @@ use mockall::mock;
 use crate::{
     columns::latest_settled_certificate_per_network::SettledCertificate,
     error::Error,
-    stores::{MetadataReader, MetadataWriter, StateReader, StateWriter},
+    stores::{
+        MetadataReader, MetadataWriter, NetworkInfoReader, StateReader, StateWriter,
+        UpdateEvenIfAlreadyPresent, UpdateStatusToCandidate,
+    },
 };
 mock! {
     pub StateStore {}
+    impl NetworkInfoReader for StateStore {
+        fn get_network_info(&self, network_id: NetworkId) -> Result<agglayer_types::NetworkInfo, Error>;
+
+        fn get_latest_pending_height(&self, network_id: NetworkId) -> Result<Option<Height>, Error>;
+
+        fn get_latest_settled_certificate_id(
+            &self,
+            network_id: NetworkId,
+        ) -> Result<Option<CertificateId>, Error>;
+    }
+
     impl MetadataReader for StateStore {
         fn get_latest_settled_epoch(&self) -> Result<Option<EpochNumber>, Error>;
     }
@@ -24,7 +38,15 @@ mock! {
             &self,
             certificate_id: &CertificateId,
             tx_hash: SettlementTxHash,
+            force: UpdateEvenIfAlreadyPresent,
+            set_status: UpdateStatusToCandidate,
         ) -> Result<(), Error>;
+
+        fn remove_settlement_tx_hash(
+            &self,
+            certificate_id: &CertificateId,
+        ) -> Result<(), Error>;
+
         fn assign_certificate_to_epoch(
             &self,
             certificate_id: &CertificateId,
@@ -59,9 +81,18 @@ mock! {
             new_state: &LocalNetworkStateData,
             new_leaves: &[Digest],
         ) -> Result<(), Error>;
+
+        fn disable_network(
+            &self,
+            network_id: &NetworkId,
+            disabled_by: agglayer_types::network_info::DisabledBy,
+        ) -> Result<(), Error>;
+        fn enable_network(&self, network_id: &NetworkId) -> Result<(), Error>;
     }
 
     impl StateReader for StateStore {
+        fn get_disabled_networks(&self) -> Result<Vec<NetworkId>, Error>;
+        fn is_network_disabled(&self, network_id: &NetworkId) -> Result<bool, Error>;
         fn get_active_networks(&self) -> Result<Vec<NetworkId>, Error>;
 
         fn get_latest_settled_certificate_per_network(

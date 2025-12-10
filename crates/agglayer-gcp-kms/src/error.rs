@@ -11,9 +11,9 @@ pub enum Error {
     /// This variant is used when a required key or environment variable is
     /// missing.
     #[error("KMS configuration error: missing key or env {0}")]
-    KmsConfig(&'static str),
+    KmsConfig(String),
 
     /// An error occurred while interacting with the KMS provider.
     #[error("KMS error: {0}")]
-    KmsError(anyhow::Error),
+    KmsError(eyre::Error),
 }

@@ -1,26 +1,21 @@
 use std::process::exit;
 
 use agglayer_config::storage::backup::BackupConfig;
-use anyhow::Context;
 use clap::Parser;
 use cli::Cli;
+use eyre::Context as _;
 use pessimistic_proof::ELF;
+use sp1_sdk::HashableKey as _;
 
 mod cli;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> eyre::Result<()> {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
 
     match cli.cmd {
         cli::Commands::Run { cfg } => agglayer_node::main(cfg, &version(), None)?,
-        cli::Commands::Prover { cfg } => agglayer_prover::main(cfg, &version(), ELF)?,
-        cli::Commands::ProverConfig => println!(
-            "{}",
-            toml::to_string_pretty(&agglayer_prover_config::ProverConfig::default())
-                .context("Failed to serialize ProverConfig to TOML")?
-        ),
         cli::Commands::Config { base_dir } => println!(
             "{}",
             toml::to_string_pretty(&agglayer_config::Config::new(&base_dir))
@@ -39,8 +34,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
         cli::Commands::Vkey => {
-            let vkey_hex = agglayer_prover::compute_program_vkey(ELF);
-            println!("{vkey_hex}");
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async move {
+                    let vkey_hex = compute_program_vkey(ELF)
+                        .await
+                        .context("Failed to compute program vkey");
+                    match vkey_hex {
+                        Ok(vkey_hex) => println!("{vkey_hex}"),
+                        Err(error) => eprintln!("{error:?}"),
+                    }
+                });
         }
 
         cli::Commands::VkeySelector => {
@@ -92,4 +97,11 @@ pub fn version() -> String {
     let git_describe = env!("VERGEN_GIT_DESCRIBE");
     let timestamp = env!("VERGEN_GIT_COMMIT_TIMESTAMP");
     format!("{pkg_name} ({git_describe}) [git commit timestamp: {timestamp}]")
+}
+
+pub async fn compute_program_vkey(program: &'static [u8]) -> eyre::Result<String> {
+    let vkey = prover_executor::Executor::compute_program_vkey(program)
+        .await
+        .context("Failed to compute program vkey")?;
+    Ok(vkey.bytes32())
 }

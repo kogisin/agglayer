@@ -1,11 +1,11 @@
 use agglayer_interop_types::LocalExitRoot;
 use agglayer_primitives::{Address, SignatureError};
 use agglayer_tries::error::SmtError;
-use pessimistic_proof::{error::ProofVerificationError, ProofError};
+use pessimistic_proof::{core::MultisigError, error::ProofVerificationError, ProofError};
 use serde::{Deserialize, Serialize};
 use unified_bridge::{GlobalIndex, LocalExitTreeError, NetworkId, TokenInfo};
 
-use crate::{Digest, GenerationType};
+use crate::{aggchain_data::AggchainDataError, Digest, GenerationType};
 
 #[derive(Debug, thiserror::Error, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename = "agglayer_types::Error")]
@@ -91,6 +91,9 @@ pub enum Error {
         computed: LocalExitRoot,
         declared: LocalExitRoot,
     },
+
+    #[error("Invalid multisig, signature or aggchain proof related data. {0:?}")]
+    InvalidChainData(AggchainDataError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error, PartialEq, Eq)]
@@ -143,14 +146,11 @@ pub enum SignerError {
     Recovery(#[source] SignatureError),
 
     #[error(
-        "Invalid extra signature either due to wrong signer or commitment. expected signer: \
-         {expected_signer}"
-    )]
-    InvalidExtraSignature { expected_signer: Address },
-
-    #[error(
         "Invalid PP signature either due to wrong signer or commitment. expected signer: \
          {expected_signer}"
     )]
     InvalidPessimisticProofSignature { expected_signer: Address },
+
+    #[error("Invalid multisig: {0}")]
+    InvalidMultisig(#[source] MultisigError),
 }

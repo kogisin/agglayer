@@ -1,24 +1,30 @@
 //! The core logic of the agglayer.
 use std::sync::Arc;
 
-use agglayer_config::Config;
-use agglayer_contracts::contracts::{
-    PolygonRollupManager::{PolygonRollupManagerInstance, RollupDataReturnV2},
-    PolygonZkEvm::PolygonZkEvmInstance,
+use agglayer_config::{outbound::OutboundRpcSettleConfig, Config};
+use agglayer_contracts::{
+    adjust_gas_estimate,
+    contracts::{
+        PolygonRollupManager::{
+            verifyBatchesTrustedAggregatorCall, PolygonRollupManagerInstance, RollupDataReturnV2,
+        },
+        PolygonZkEvm::PolygonZkEvmInstance,
+    },
+    GasPriceParams,
 };
 use agglayer_rate_limiting::RateLimiter;
 use agglayer_rpc::error::SignatureVerificationError;
-use agglayer_types::Address;
+use agglayer_types::{primitives::alloy_primitives::TxHash, Address};
 use alloy::{
     contract::Error as ContractError,
-    network::Ethereum,
     primitives::{BlockNumber, B256},
-    providers::{PendingTransactionBuilder, PendingTransactionError, Provider},
+    providers::{PendingTransactionError, Provider},
     rpc::types::TransactionReceipt,
     transports::{RpcError, TransportErrorKind},
 };
+use futures::TryFutureExt;
 use thiserror::Error;
-use tracing::{info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{signed_tx::SignedTx, zkevm_node_client::ZkevmNodeClient};
 
@@ -37,6 +43,8 @@ pub struct Kernel<RpcProvider> {
     rpc: Arc<RpcProvider>,
     rate_limiter: RateLimiter,
     config: Arc<Config>,
+    gas_price_params: GasPriceParams,
+    settlement_config: OutboundRpcSettleConfig,
 }
 
 /// Errors related to the ZkEVM node proof verification process.
@@ -65,12 +73,20 @@ pub enum ZkevmNodeVerificationError {
 }
 
 impl<RpcProvider> Kernel<RpcProvider> {
-    pub fn new(rpc: Arc<RpcProvider>, config: Arc<Config>) -> Self {
-        Self {
+    pub fn new(rpc: Arc<RpcProvider>, config: Arc<Config>) -> eyre::Result<Self> {
+        Ok(Self {
             rpc,
             rate_limiter: RateLimiter::new(config.rate_limiting.clone()),
+            gas_price_params: {
+                let gas_config = &config.outbound.rpc.settle_tx.gas_price;
+                agglayer_contracts::GasPriceParams::new(
+                    gas_config.multiplier.as_u64_per_1000(),
+                    gas_config.floor..=gas_config.ceiling,
+                )?
+            },
+            settlement_config: config.outbound.rpc.settle_tx.clone(),
             config,
-        }
+        })
     }
 
     pub(crate) fn rate_limiter(&self) -> &RateLimiter {
@@ -177,6 +193,10 @@ pub enum SettlementError {
     Timeout(std::time::Duration),
     #[error("pending transaction error: {0}")]
     PendingTransactionError(PendingTransactionError),
+    #[error("receipt without block number: {0}")]
+    ReceiptWithoutBlockNumberError(TxHash),
+    #[error("Internal error while waiting for the receipt: {0:?}")]
+    InternalError(#[source] eyre::Error),
 }
 
 #[derive(Error, Debug)]
@@ -184,6 +204,9 @@ pub enum CheckTxStatusError {
     #[error("provider error: {0}")]
     ProviderError(#[source] RpcError<TransportErrorKind>),
 }
+
+type VerifyBatchesMarker = std::marker::PhantomData<verifyBatchesTrustedAggregatorCall>;
+type VerifyBatchesBuilder<Rpc> = alloy::contract::CallBuilder<Arc<Rpc>, VerifyBatchesMarker>;
 
 impl<RpcProvider> Kernel<RpcProvider>
 where
@@ -251,7 +274,7 @@ where
     pub(crate) async fn verify_batches_trusted_aggregator(
         &self,
         signed_tx: &SignedTx,
-    ) -> Result<PendingTransactionBuilder<Ethereum>, ContractError> {
+    ) -> Result<VerifyBatchesBuilder<RpcProvider>, ContractError> {
         let sequencer_address = self
             .get_trusted_sequencer_address(signed_tx.tx.rollup_id)
             .await?;
@@ -259,7 +282,9 @@ where
         // TODO: pending state num is not yet supported
         const PENDING_STATE_NUM: u64 = 0;
 
-        self.get_rollup_manager_contract()
+        let rollup_manager_contract = self.get_rollup_manager_contract();
+        let proof_bytes = signed_tx.tx.zkp.proof.to_fixed_bytes().map(Into::into);
+        let call = rollup_manager_contract
             .verifyBatchesTrustedAggregator(
                 signed_tx.tx.rollup_id,
                 PENDING_STATE_NUM,
@@ -268,15 +293,11 @@ where
                 signed_tx.tx.zkp.new_local_exit_root,
                 signed_tx.tx.zkp.new_state_root,
                 sequencer_address.into(),
-                signed_tx
-                    .tx
-                    .zkp
-                    .proof
-                    .to_fixed_bytes()
-                    .map(|value| value.into()),
+                proof_bytes,
             )
-            .send()
-            .await
+            .with_cloned_provider();
+
+        Ok(call)
     }
 
     /// Verify that the signer of the given [`SignedTx`] is the trusted
@@ -307,36 +328,205 @@ where
     }
 
     /// Settle the given [`SignedTx`] to the rollup manager.
-    #[instrument(skip(self, rate_guard), level = "debug")]
+    #[instrument(skip(self, signed_tx, rate_guard), level = "debug")]
     pub(crate) async fn settle(
         &self,
         signed_tx: &SignedTx,
         rate_guard: agglayer_rate_limiting::SendTxSlotGuard,
     ) -> Result<TransactionReceipt, SettlementError> {
-        let hex_hash = signed_tx.hash();
-        let hash = format!("{hex_hash:?}");
-
+        let signed_tx_hash = format!("{}", signed_tx.hash());
         let pending_tx = self
             .verify_batches_trusted_aggregator(signed_tx)
+            .and_then(|mut call| async move {
+                // Adjust gas limit
+                if self.settlement_config.gas_multiplier_factor != 100 {
+                    // Adjust the gas limit based on the configuration.
+                    // Apply gas multiplier if it's not the default (100).
+                    // First estimate gas, then multiply by the factor.
+                    let gas_estimate = call.estimate_gas().await?;
+                    let adjusted_gas = (gas_estimate
+                        .saturating_mul(self.settlement_config.gas_multiplier_factor as u64))
+                        / 100;
+                    debug!(
+                        "Applying gas multiplier factor: {} for cert settlement. Estimated gas: \
+                         {}, Adjusted gas: {}",
+                        self.settlement_config.gas_multiplier_factor, gas_estimate, adjusted_gas
+                    );
+                    call = call.gas(adjusted_gas);
+                }
+
+                // Adjust gas price
+                let estimate = self.rpc.estimate_eip1559_fees().await?;
+                let adjusted = adjust_gas_estimate(&estimate, &self.gas_price_params);
+
+                debug!(
+                    gas_price_params=?self.gas_price_params,
+                    estimate=?estimate,
+                    adjusted=?adjusted,
+                    "Applying fee adjustments with gas price params"
+                );
+
+                call.max_priority_fee_per_gas(adjusted.max_priority_fee_per_gas)
+                    .max_fee_per_gas(adjusted.max_fee_per_gas)
+                    .send()
+                    .await
+            })
             .await
             .map_err(SettlementError::ContractError)?;
 
-        if let Ok(Some(tx)) = self.check_tx_status(*pending_tx.tx_hash()).await {
-            warn!(hash, "Transaction already settled: {tx:?}");
+        debug!(l1_tx_hash = %pending_tx.tx_hash(), "For signed tx {signed_tx_hash} l1 transaction {} sent", pending_tx.tx_hash());
+
+        // We submit the transaction in a separate task so we can observe the
+        // settlement process even if the client drops the transaction
+        // submission request. This is needed to correctly record the settlement
+        // rate limiting event in case the client drops the request.
+        let rpc = self.rpc.clone();
+        let settlement_config = self.settlement_config.clone();
+        let tx_hash = *pending_tx.tx_hash();
+
+        let receipt = tokio::spawn(async move {
+            Self::wait_for_transaction_receipt(rpc, settlement_config, &tx_hash)
+                .await
+                .inspect(|tx_receipt| {
+                    rate_guard.record(tokio::time::Instant::now());
+                    info!(
+                        block_hash = ?tx_receipt.block_hash,
+                        block_number = ?tx_receipt.block_number,
+                        l1_tx_hash = %tx_receipt.transaction_hash,
+                        "Inspect settle l1 transaction"
+                    )
+                })
+        });
+        receipt
+            .await
+            .map_err(|error| SettlementError::InternalError(error.into()))?
+    }
+
+    /// Wait for transaction receipt with configurable retries and intervals
+    async fn wait_for_transaction_receipt(
+        rpc: Arc<RpcProvider>,
+        settlement_config: OutboundRpcSettleConfig,
+        tx_hash: &TxHash,
+    ) -> Result<TransactionReceipt, SettlementError> {
+        let timeout = settlement_config
+            .retry_interval
+            .mul_f64(settlement_config.max_retries as f64); // only used for logs
+        let max_retries = settlement_config.max_retries;
+        let retry_interval = settlement_config.retry_interval;
+        let required_confirmations = settlement_config.confirmations;
+
+        debug!(
+            max_retries,
+            timeout=?timeout,
+            retry_interval=?retry_interval,
+            "Waiting for signed transaction receipt with timeout of {timeout:?}, max_retries: \
+             {max_retries} and retry_interval: {retry_interval:?}",
+        );
+
+        for attempt in 0..=max_retries {
+            match rpc.get_transaction_receipt(*tx_hash).await {
+                Ok(Some(receipt)) => {
+                    info!(attempt, "Successfully fetched transaction receipt");
+
+                    // Wait for the required number of confirmations
+                    if required_confirmations > 0 {
+                        let receipt_block = receipt.block_number.ok_or_else(|| {
+                            error!(%tx_hash, "Transaction receipt has no block number");
+                            SettlementError::ReceiptWithoutBlockNumberError(
+                                receipt.transaction_hash,
+                            )
+                        })?;
+
+                        debug!(
+                            receipt_block,
+                            required_confirmations, "Waiting for L1 block confirmations"
+                        );
+
+                        // Wait until we have the required number of confirmations
+                        for confirmation_attempt in attempt..=max_retries {
+                            match rpc.get_block_number().await {
+                                Ok(current_block) => {
+                                    let current_confirmations = current_block
+                                        .saturating_sub(receipt_block)
+                                        .saturating_add(1);
+                                    if current_confirmations >= required_confirmations as u64 {
+                                        info!(
+                                            current_confirmations,
+                                            required_confirmations,
+                                            current_block,
+                                            "L1 transaction confirmed with required confirmations"
+                                        );
+                                        return Ok(receipt);
+                                    } else {
+                                        debug!(
+                                            current_confirmations,
+                                            required_confirmations,
+                                            "Waiting for more confirmations, sleeping"
+                                        );
+                                        tokio::time::sleep(retry_interval).await;
+                                    }
+                                }
+                                Err(error) => {
+                                    if confirmation_attempt < max_retries {
+                                        warn!(
+                                            ?error,
+                                            "Failed to get current block number, retrying"
+                                        );
+                                        tokio::time::sleep(retry_interval).await;
+                                        continue;
+                                    } else {
+                                        error!(
+                                            ?error,
+                                            "Failed to get current block number after maximum \
+                                             retries"
+                                        );
+                                        return Err(SettlementError::ProviderError(error));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Timeout waiting for confirmations
+                        error!(
+                            ?timeout,
+                            "Timeout while waiting for transaction confirmations"
+                        );
+                        return Err(SettlementError::Timeout(timeout));
+                    } else {
+                        // No confirmations required, return immediately
+                        return Ok(receipt);
+                    }
+                }
+                Ok(None) => {
+                    // Transaction not yet included in a block, continue retrying
+                    if attempt < max_retries {
+                        debug!(
+                            %tx_hash,
+                            next_attempt = attempt + 1,
+                            max_retries,
+                            retry_interval = ?retry_interval,
+                            "L1 transaction receipt not found yet, retrying",
+                        );
+                        tokio::time::sleep(retry_interval).await;
+                        continue;
+                    }
+                }
+                Err(error) => {
+                    // Other error (e.g., network issue, RPC error)
+                    error!(
+                        ?error,
+                        "Error watching the pending signed transaction settlement"
+                    );
+                    return Err(SettlementError::ProviderError(error));
+                }
+            }
         }
 
-        pending_tx
-            .get_receipt()
-            .await
-            .inspect(|tx_receipt| {
-                rate_guard.record(tokio::time::Instant::now());
-                info!(
-                    block_hash = ?tx_receipt.block_hash,
-                    block_number = ?tx_receipt.block_number,
-                    "Inspect settle transaction: {}", tx_receipt.transaction_hash
-                )
-            })
-            .map_err(SettlementError::PendingTransactionError)
+        error!(
+            ?timeout,
+            "Timeout while watching the pending signed transaction settlement"
+        );
+        Err(SettlementError::Timeout(timeout))
     }
 
     /// Check the status of the given hash.
@@ -373,11 +563,32 @@ where
         &self,
         cert: &agglayer_types::Certificate,
     ) -> Result<(), SignatureVerificationError> {
+        use agglayer_types::{aggchain_data::MultisigCtx, aggchain_proof::AggchainData};
+
         let sequencer_address = self
             .get_trusted_sequencer_address(u32::from(cert.network_id))
             .await?;
 
-        cert.verify_cert_signature(sequencer_address)
-            .map_err(SignatureVerificationError::from_signer_error)
+        let multisig_ctx = MultisigCtx {
+            signers: Default::default(), // TODO: to fetch from L1
+            threshold: 1,                // TODO: to fetch from L1
+            prehash: cert.signature_commitment_values().multisig_commitment(),
+        };
+
+        match &cert.aggchain_data {
+            AggchainData::ECDSA { signature } => {
+                cert.verify_legacy_ecdsa(sequencer_address, signature)
+            }
+            AggchainData::Generic { signature, .. } => {
+                cert.verify_aggchain_proof_signature(sequencer_address, signature)
+            }
+            AggchainData::MultisigOnly { multisig } => {
+                cert.verify_multisig(multisig.into(), multisig_ctx)
+            }
+            AggchainData::MultisigAndAggchainProof { multisig, .. } => {
+                cert.verify_multisig(multisig.into(), multisig_ctx)
+            }
+        }
+        .map_err(SignatureVerificationError::from_signer_error)
     }
 }

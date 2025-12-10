@@ -18,7 +18,8 @@ use agglayer_storage::{
     stores::{
         epochs::EpochsStore, pending::PendingStore, state::StateStore, EpochStoreReader,
         EpochStoreWriter, PendingCertificateReader, PendingCertificateWriter, PerEpochReader,
-        PerEpochWriter, StateReader, StateWriter,
+        PerEpochWriter, StateReader, StateWriter, UpdateEvenIfAlreadyPresent,
+        UpdateStatusToCandidate,
     },
     tests::{
         mocks::{MockEpochsStore, MockPendingStore, MockPerEpochStore, MockStateStore},
@@ -33,8 +34,7 @@ use arc_swap::ArcSwap;
 use futures_util::poll;
 use mocks::MockCertifier;
 use pessimistic_proof::{
-    keccak::Keccak256Hasher, multi_batch_header::MultiBatchHeader, LocalNetworkState,
-    PessimisticProofOutput,
+    multi_batch_header::MultiBatchHeader, LocalNetworkState, PessimisticProofOutput,
 };
 use rstest::fixture;
 use tokio::sync::{broadcast, mpsc};
@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     settlement_client::{MockProvider, MockSettlementClient, SettlementClient},
     CertificateInput, CertificateOrchestrator, CertificationError, Certifier, CertifierOutput,
-    CertifierResult, Error,
+    CertifierResult, Error, NonceInfo,
 };
 
 pub(crate) mod mocks;
@@ -112,6 +112,16 @@ impl PerEpochWriter for DummyPendingStore {
 }
 
 impl StateReader for DummyPendingStore {
+    fn get_disabled_networks(&self) -> Result<Vec<NetworkId>, agglayer_storage::error::Error> {
+        Ok(Vec::new())
+    }
+    fn is_network_disabled(
+        &self,
+        _network_id: &NetworkId,
+    ) -> Result<bool, agglayer_storage::error::Error> {
+        Ok(false)
+    }
+
     fn get_active_networks(&self) -> Result<Vec<NetworkId>, agglayer_storage::error::Error> {
         Ok(vec![])
     }
@@ -170,7 +180,24 @@ impl StateReader for DummyPendingStore {
         todo!()
     }
 }
-impl EpochStoreReader for DummyPendingStore {}
+impl EpochStoreReader for DummyPendingStore {
+    fn get_certificate(
+        &self,
+        _epoch_number: EpochNumber,
+        _index: CertificateIndex,
+    ) -> Result<Option<Certificate>, agglayer_storage::error::Error> {
+        // This is a dummy implementation for testing
+        Ok(None)
+    }
+
+    fn get_proof(
+        &self,
+        _epoch_number: EpochNumber,
+        _index: CertificateIndex,
+    ) -> Result<Option<Proof>, agglayer_storage::error::Error> {
+        Ok(None)
+    }
+}
 
 impl EpochStoreWriter for DummyPendingStore {
     type PerEpochStore = Self;
@@ -267,10 +294,32 @@ impl PendingCertificateWriter for DummyPendingStore {
 }
 
 impl StateWriter for DummyPendingStore {
+    fn disable_network(
+        &self,
+        _network_id: &NetworkId,
+        _disabled_by: agglayer_types::network_info::DisabledBy,
+    ) -> Result<(), agglayer_storage::error::Error> {
+        Ok(())
+    }
+    fn enable_network(
+        &self,
+        _network_id: &NetworkId,
+    ) -> Result<(), agglayer_storage::error::Error> {
+        Ok(())
+    }
     fn update_settlement_tx_hash(
         &self,
         _certificate_id: &CertificateId,
         _tx_hash: SettlementTxHash,
+        _force: UpdateEvenIfAlreadyPresent,
+        _set_status: UpdateStatusToCandidate,
+    ) -> Result<(), agglayer_storage::error::Error> {
+        todo!()
+    }
+
+    fn remove_settlement_tx_hash(
+        &self,
+        _certificate_id: &CertificateId,
     ) -> Result<(), agglayer_storage::error::Error> {
         todo!()
     }
@@ -877,6 +926,7 @@ impl SettlementClient for Check {
     async fn submit_certificate_settlement(
         &self,
         _certificate_id: CertificateId,
+        _nonce_info: Option<NonceInfo>,
     ) -> Result<SettlementTxHash, Error> {
         Ok(SettlementTxHash::for_tests())
     }
@@ -889,6 +939,31 @@ impl SettlementClient for Check {
         _certificate_id: CertificateId,
     ) -> Result<(EpochNumber, CertificateIndex), Error> {
         Ok((EpochNumber::ZERO, CertificateIndex::ZERO))
+    }
+
+    fn get_provider(&self) -> &Self::Provider {
+        unimplemented!("get_provider not needed in tests")
+    }
+
+    async fn fetch_last_settled_pp_root(
+        &self,
+        _network_id: NetworkId,
+    ) -> Result<Option<([u8; 32], SettlementTxHash)>, Error> {
+        Ok(None)
+    }
+
+    async fn fetch_settlement_nonce(
+        &self,
+        _settlement_tx_hash: SettlementTxHash,
+    ) -> Result<Option<NonceInfo>, Error> {
+        Ok(None)
+    }
+
+    async fn fetch_settlement_receipt_status(
+        &self,
+        _settlement_tx_hash: SettlementTxHash,
+    ) -> Result<crate::TxReceiptStatus, Error> {
+        Ok(crate::TxReceiptStatus::TxSuccessful)
     }
 }
 
@@ -927,6 +1002,7 @@ impl Certifier for Check {
             height,
             new_state: local_state,
             network: network_id,
+            new_pp_root: Digest::ZERO,
         };
         _ = self.executed.try_send(result.clone());
         Ok(result)
@@ -936,14 +1012,9 @@ impl Certifier for Check {
         &self,
         _certificate: &agglayer_types::Certificate,
         _state: &mut LocalNetworkStateData,
-    ) -> Result<
-        (
-            MultiBatchHeader<Keccak256Hasher>,
-            LocalNetworkState,
-            PessimisticProofOutput,
-        ),
-        CertificationError,
-    > {
+        _certificate_tx_hash: Option<Digest>,
+    ) -> Result<(MultiBatchHeader, LocalNetworkState, PessimisticProofOutput), CertificationError>
+    {
         Err(CertificationError::InternalError(
             "unimplemented".to_string(),
         ))

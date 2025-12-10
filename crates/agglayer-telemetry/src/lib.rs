@@ -22,6 +22,8 @@ use crate::{
 mod constant;
 mod error;
 
+pub mod clock;
+
 pub use error::Error;
 pub use opentelemetry::KeyValue;
 
@@ -179,7 +181,7 @@ impl ServerBuilder {
             .build()
             .unwrap();
 
-        // set up a meter meter to create instruments
+        // set up a meter to create instruments
         let provider = SdkMeterProvider::builder().with_reader(exporter).build();
 
         global::set_meter_provider(provider);

@@ -3,10 +3,9 @@
 //! The agglayer is configured via its TOML configuration file, `agglayer.toml`
 //! by default, which is deserialized into the [`Config`] struct.
 
-use std::{collections::HashMap, path::Path, str::FromStr};
+use std::{collections::HashMap, path::Path};
 
 use agglayer_primitives::Address;
-use agglayer_prover_config::GrpcConfig;
 use outbound::OutboundConfig;
 use serde::{de::DeserializeSeed, Deserialize, Serialize};
 use serde_with::DisplayFromStr;
@@ -15,17 +14,18 @@ use url::Url;
 
 pub use self::telemetry::TelemetryConfig;
 
-pub mod prover;
-
 pub(crate) const DEFAULT_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(0, 0, 0, 0);
 
 pub(crate) mod auth;
 pub mod certificate_orchestrator;
 pub mod epoch;
+pub mod grpc;
 pub(crate) mod l1;
 pub(crate) mod l2;
 pub mod log;
+mod multiplier;
 pub mod outbound;
+mod port;
 pub mod rate_limiting;
 pub(crate) mod rpc;
 pub mod shutdown;
@@ -38,7 +38,8 @@ pub use epoch::Epoch;
 pub use l1::L1;
 pub use l2::L2;
 pub use log::Log;
-use prover::default_prover_entrypoint;
+pub use multiplier::Multiplier;
+use port::{Port, PortDefaults};
 pub use rate_limiting::RateLimitingConfig;
 pub use rpc::RpcConfig;
 
@@ -107,13 +108,12 @@ pub struct Config {
     #[serde(default)]
     pub storage: storage::StorageConfig,
 
-    /// AggLayer prover entrypoint.
-    #[serde(default = "default_prover_entrypoint")]
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub prover_entrypoint: String,
+    /// The prover config
+    #[serde(default)]
+    pub prover: prover_config::ProverType,
 
-    #[serde(default, skip_serializing_if = "crate::is_default")]
-    pub prover: agglayer_prover_config::ClientProverConfig,
+    #[serde(default = "default_prover_buffer_size")]
+    pub prover_buffer_size: usize,
 
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
@@ -123,16 +123,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub mock_verifier: bool,
 
-    #[serde(default, skip_serializing_if = "crate::is_default")]
-    pub grpc: GrpcConfig,
-
-    /// Extra Certificate signer per network.
-    /// Signatures is expected to be performed on the same commitment as
-    /// the certificate signature, which is the V2 commitment for now.
     #[serde(default)]
-    #[serde_as(as = "HashMap<DisplayFromStr, _>")]
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub extra_certificate_signer: HashMap<u32, Address>,
+    pub grpc: grpc::GrpcConfig,
 }
 
 impl Config {
@@ -155,7 +147,8 @@ impl Config {
 
         let config_with_path = ConfigDeserializer { path };
 
-        let deserializer = toml::de::Deserializer::new(&reader);
+        let deserializer = toml::de::Deserializer::parse(&reader)
+            .map_err(ConfigurationError::DeserializationError)?;
 
         config_with_path
             .deserialize(deserializer)
@@ -180,28 +173,29 @@ impl Config {
             epoch: Default::default(),
             shutdown: Default::default(),
             certificate_orchestrator: Default::default(),
-            prover_entrypoint: default_prover_entrypoint(),
-            prover: Default::default(),
+            prover: prover_config::ProverType::NetworkProver(
+                prover_config::NetworkProverConfig::default(),
+            ),
+            prover_buffer_size: default_prover_buffer_size(),
             debug_mode: false,
             mock_verifier: false,
             grpc: Default::default(),
-            extra_certificate_signer: Default::default(),
         }
     }
 
     /// Get the target ReadRPC socket address from the configuration.
     pub fn readrpc_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::from((self.rpc.host, self.rpc.readrpc_port))
+        std::net::SocketAddr::from((self.rpc.host, self.rpc.readrpc_port.as_u16()))
     }
 
     /// Get the target gRPC socket address from the configuration.
     pub fn public_grpc_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::from((self.rpc.host, self.rpc.grpc_port))
+        std::net::SocketAddr::from((self.rpc.host, self.rpc.grpc_port.as_u16()))
     }
 
     /// Get the admin RPC socket address from the configuration.
     pub fn admin_rpc_addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::from((self.rpc.host, self.rpc.admin_port))
+        std::net::SocketAddr::from((self.rpc.host, self.rpc.admin_port.as_u16()))
     }
 
     pub fn path_contextualized(mut self, base_path: &Path) -> Self {
@@ -263,18 +257,15 @@ impl<'de> DeserializeSeed<'de> for ConfigDeserializer<'_> {
     }
 }
 
+/// Default prover buffer size.
+const fn default_prover_buffer_size() -> usize {
+    100
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
 pub(crate) fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == Default::default()
-}
-
-/// Get an environment variable or a default value if it is not set.
-fn from_env_or_default<T: FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
 }

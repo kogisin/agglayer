@@ -25,7 +25,7 @@ use crate::{
         start_checkpoint::StartCheckpointColumn,
     },
     error::{CertificateCandidateError, Error},
-    storage::{backup::BackupClient, epochs_db_cf_definitions, DB},
+    storage::{backup::BackupClient, DB},
     types::{PerEpochMetadataKey, PerEpochMetadataValue},
 };
 
@@ -48,6 +48,14 @@ pub struct PerEpochStore<PendingStore, StateStore> {
 }
 
 impl<PendingStore, StateStore> PerEpochStore<PendingStore, StateStore> {
+    pub fn init_db(path: &std::path::Path) -> Result<DB, crate::storage::DBError> {
+        DB::open_cf(path, crate::storage::epochs_db_cf_definitions())
+    }
+
+    pub fn init_db_readonly(path: &std::path::Path) -> Result<DB, crate::storage::DBError> {
+        DB::open_cf_readonly(path, crate::storage::epochs_db_cf_definitions())
+    }
+
     pub fn try_open(
         config: Arc<agglayer_config::Config>,
         epoch_number: EpochNumber,
@@ -56,16 +64,53 @@ impl<PendingStore, StateStore> PerEpochStore<PendingStore, StateStore> {
         optional_start_checkpoint: Option<BTreeMap<NetworkId, Height>>,
         backup_client: BackupClient,
     ) -> Result<Self, Error> {
-        // TODO: refactor this
-        let path = config
-            .storage
-            .epochs_db_path
-            .join(format!("{epoch_number}"));
+        let db = Arc::new(Self::init_db(&config.storage.epoch_db_path(epoch_number))?);
 
-        let db = Arc::new(DB::open_cf(&path, epochs_db_cf_definitions())?);
+        Self::try_open_with_db(
+            db,
+            epoch_number,
+            pending_store,
+            state_store,
+            optional_start_checkpoint,
+            backup_client,
+            false, // readonly mode
+        )
+    }
 
-        // Check if the epoch is already packed, if no value is found, the epoch is not
-        // packed
+    /// Open a PerEpochStore in read-only mode to prevent concurrency issues.
+    /// This is useful for operations that only need to read data from the database.
+    pub fn try_open_readonly(
+        config: Arc<agglayer_config::Config>,
+        epoch_number: EpochNumber,
+        pending_store: Arc<PendingStore>,
+        state_store: Arc<StateStore>,
+    ) -> Result<Self, Error> {
+        let db = Arc::new(Self::init_db_readonly(
+            &config.storage.epoch_db_path(epoch_number),
+        )?);
+
+        Self::try_open_with_db(
+            db,
+            epoch_number,
+            pending_store,
+            state_store,
+            None,                 // No start checkpoint for readonly
+            BackupClient::noop(), // No backup needed for readonly access
+            true,                 // readonly mode
+        )
+    }
+
+    /// Common initialization logic for both read-write and read-only modes
+    fn try_open_with_db(
+        db: Arc<DB>,
+        epoch_number: EpochNumber,
+        pending_store: Arc<PendingStore>,
+        state_store: Arc<StateStore>,
+        optional_start_checkpoint: Option<BTreeMap<NetworkId, Height>>,
+        backup_client: BackupClient,
+        readonly: bool,
+    ) -> Result<Self, Error> {
+        // Check if the epoch is already packed, if no value is found, the epoch is not packed
         let packed = db
             .get::<PerEpochMetadataColumn>(&PerEpochMetadataKey::Packed)?
             .map(|value| match value {
@@ -87,40 +132,52 @@ impl<PendingStore, StateStore> PerEpochStore<PendingStore, StateStore> {
                 .filter_map(|v| v.ok())
                 .collect::<BTreeMap<NetworkId, Height>>();
 
-            match optional_start_checkpoint {
-                Some(expected_start_checkpoint) => {
-                    if checkpoint.is_empty() {
-                        db.multi_insert::<StartCheckpointColumn>(&expected_start_checkpoint)?;
-                        expected_start_checkpoint
-                    } else if checkpoint != expected_start_checkpoint {
-                        warn!(
-                            "Start checkpoint doesn't match the expected one, using the one from \
-                             the DB"
-                        );
-                        return Err(Error::Unexpected(
-                            "Start checkpoint doesn't match the expected one, using the one from \
-                             the DB"
-                                .to_string(),
-                        ))?;
-                    } else {
-                        checkpoint
+            if readonly {
+                // For readonly access, we just use the existing checkpoint
+                checkpoint
+            } else {
+                // For read-write access, handle optional_start_checkpoint
+                match optional_start_checkpoint {
+                    Some(expected_start_checkpoint) => {
+                        if checkpoint.is_empty() {
+                            db.multi_insert::<StartCheckpointColumn>(&expected_start_checkpoint)?;
+                            expected_start_checkpoint
+                        } else if checkpoint != expected_start_checkpoint {
+                            warn!(
+                                "Start checkpoint doesn't match the expected one, using the one from \
+                                 the DB"
+                            );
+                            return Err(Error::Unexpected(
+                                "Start checkpoint doesn't match the expected one, using the one from \
+                                 the DB"
+                                    .to_string(),
+                            ))?;
+                        } else {
+                            checkpoint
+                        }
                     }
+                    None => checkpoint,
                 }
-                None => checkpoint,
             }
         };
 
-        let next_certificate_index = if let Some(Ok((index, _))) = db
-            .iter_with_direction::<CertificatePerIndexColumn>(
-                ReadOptions::default(),
-                rocksdb::Direction::Reverse,
-            )?
-            .next()
-        {
-            // We're starting from the next index after the last one found in the database.
-            AtomicU64::new(index.as_u64() + 1)
-        } else {
+        let next_certificate_index = if readonly {
+            // For readonly access, we don't need to track the next index
             AtomicU64::new(0)
+        } else {
+            // For read-write access, calculate the next index from existing certificates
+            if let Some(Ok((index, _))) = db
+                .iter_with_direction::<CertificatePerIndexColumn>(
+                    ReadOptions::default(),
+                    rocksdb::Direction::Reverse,
+                )?
+                .next()
+            {
+                // We're starting from the next index after the last one found in the database.
+                AtomicU64::new(index.as_u64() + 1)
+            } else {
+                AtomicU64::new(0)
+            }
         };
 
         let end_checkpoint = {
@@ -132,18 +189,24 @@ impl<PendingStore, StateStore> PerEpochStore<PendingStore, StateStore> {
                 .filter_map(|v| v.ok())
                 .collect::<BTreeMap<NetworkId, Height>>();
 
-            if checkpoint.is_empty() {
-                if next_certificate_index.load(Ordering::Relaxed) != 0 {
-                    return Err(Error::Unexpected(
-                        "End checkpoint is empty, but there are certificates in the DB".to_string(),
-                    ))?;
-                }
-
-                db.multi_insert::<EndCheckpointColumn>(&start_checkpoint)?;
-
-                start_checkpoint.clone()
-            } else {
+            if readonly {
+                // For readonly access, just use the existing checkpoint
                 checkpoint
+            } else {
+                // For read-write access, handle empty checkpoint
+                if checkpoint.is_empty() {
+                    if next_certificate_index.load(Ordering::Relaxed) != 0 {
+                        return Err(Error::Unexpected(
+                            "End checkpoint is empty, but there are certificates in the DB"
+                                .to_string(),
+                        ))?;
+                    }
+
+                    db.multi_insert::<EndCheckpointColumn>(&start_checkpoint)?;
+                    start_checkpoint.clone()
+                } else {
+                    checkpoint
+                }
             }
         };
 
@@ -263,7 +326,9 @@ where
             }
             // If the network is found in the end checkpoint and the height is 0,
             // this is an invalid certificate candidate and the operation should fail.
-            (Some(_start_height), Entry::Occupied(ref current_height)) if height == Height::ZERO => {
+            (Some(_start_height), Entry::Occupied(ref current_height))
+                if height == Height::ZERO =>
+            {
                 return Err(CertificateCandidateError::UnexpectedHeight(
                     network_id,
                     height,
@@ -315,7 +380,8 @@ where
                 )
             })?;
 
-        let certificate_index = CertificateIndex::new(self.next_certificate_index.fetch_add(1, Ordering::SeqCst));
+        let certificate_index =
+            CertificateIndex::new(self.next_certificate_index.fetch_add(1, Ordering::SeqCst));
 
         // TODO: all of this need to be batched
 

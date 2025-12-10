@@ -9,17 +9,18 @@ agglayer-certificate-orchestrator = { path = "../agglayer-certificate-orchestrat
 agglayer-config = { path = "../agglayer-config" }
 agglayer-contracts = { path = "../agglayer-contracts" }
 agglayer-storage = { path = "../agglayer-storage" }
+agglayer-primitives.workspace = true
 agglayer-types.workspace = true
 pessimistic-proof = { path = "../pessimistic-proof" }
 
-agglayer-prover-types.workspace = true
 prover-config.workspace = true
-agglayer-prover-config.workspace = true
+prover-executor.workspace = true
+prover-engine.workspace = true
 
-anyhow.workspace = true
 async-trait.workspace = true
 arc-swap.workspace = true
 alloy.workspace = true
+eyre.workspace = true
 fail.workspace = true
 futures.workspace = true
 hex.workspace = true
@@ -28,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tower.workspace = true
 tonic = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 
@@ -35,18 +37,20 @@ sp1-sdk.workspace = true
 sp1-prover.workspace = true
 
 [dev-dependencies]
-agglayer-prover = { workspace = true, features = ["testutils"] }
 agglayer-storage = { path = "../agglayer-storage", features = ["testutils"] }
 pessimistic-proof = { workspace = true, features = ["testutils"] }
 pessimistic-proof-test-suite = { path = "../pessimistic-proof-test-suite" }
 
 async-trait.workspace = true
 alloy.workspace = true
+arc-swap.workspace = true
 fail = { workspace = true, features = ["failpoints"] }
 mockall.workspace = true
+prover-alloy.workspace = true
 rstest.workspace = true
 test-log.workspace = true
 tokio-util.workspace = true
+url.workspace = true
 
 [features]
 coverage = []
